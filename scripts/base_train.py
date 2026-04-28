@@ -53,6 +53,12 @@ parser.add_argument("--aspect-ratio", type=int, default=64, help="model_dim = de
 parser.add_argument("--head-dim", type=int, default=128, help="target head dimension for attention")
 parser.add_argument("--n-kv-head", type=int, default=-1, help="number of key/value heads for GQA / basis K/V heads for BQA. -1 (default) = n_head/2 (2:1 ratio). Pass n_head explicitly for MHA. Must divide n_head.")
 parser.add_argument("--attn-kind", type=str, default="gqa", choices=["gqa", "bqa", "bqa_dyn"], help="attention kind: 'gqa' (grouped-query, default), 'bqa' (basis-query, static per-layer mixing logits), or 'bqa_dyn' (per-query mixing logits = alpha_proj(x) + b_alpha, single softmax over a w-mixed score).")
+parser.add_argument("--bqa-init-mass-k", type=float, default=0.58, help="BQA / bqa_dyn: target softmax probability mass on the GQA-assigned basis for K (alpha_k) at init (in (0,1)). bqa_dyn uses this for its single b_alpha. Default 0.58 reproduces the d12 logit≈1.0 sweet spot.")
+parser.add_argument("--bqa-init-mass-v", type=float, default=0.58, help="BQA: target softmax probability mass on the GQA-assigned basis for V (alpha_v) at init (in (0,1)). Trained-entropy data shows V converges much more concentrated than K, so m_v can usefully be initialized higher than m_k. Ignored for bqa_dyn.")
+parser.add_argument("--alpha-lr-mult", type=float, default=1.0, help="BQA: multiplier on the alpha_{k,v} (and bqa_dyn b_alpha) AdamW LR, on top of the embedding_lr * dmodel scale. 1.0 is the existing baseline.")
+parser.add_argument("--alpha-beta1", type=float, default=0.9, help="BQA: AdamW beta1 for the alpha_{k,v} group. Default 0.9 matches the existing baseline; lower (e.g. 0.5) gives faster response on these tiny logit tensors.")
+parser.add_argument("--alpha-wd", type=float, default=0.0, help="BQA: AdamW weight_decay for the alpha_{k,v} group. Default 0.0 to avoid pulling the softmax toward uniform; small positive values may regularize.")
+parser.add_argument("--seed", type=int, default=42, help="global torch seed for model init / dataloader shuffling. Same value used across all DDP ranks; non-determinism remains from cuDNN / flash-attn / fp8 kernels.")
 parser.add_argument("--max-seq-len", type=int, default=2048, help="max context length")
 parser.add_argument("--window-pattern", type=str, default="SSSL", help="sliding window pattern tiled across layers: L=full, S=half context (e.g. 'SSL')")
 # Training horizon (only one used, in order of precedence)
@@ -86,7 +92,7 @@ user_config = vars(args).copy()  # for logging
 # Compute init and wandb logging
 
 device_type = autodetect_device_type() if args.device_type == "" else args.device_type
-ddp, ddp_rank, ddp_local_rank, ddp_world_size, device = compute_init(device_type)
+ddp, ddp_rank, ddp_local_rank, ddp_world_size, device = compute_init(device_type, seed=args.seed)
 master_process = ddp_rank == 0 # this process will do logging, checkpointing etc.
 synchronize = torch.cuda.synchronize if device_type == "cuda" else lambda: None
 get_max_memory = torch.cuda.max_memory_allocated if device_type == "cuda" else lambda: 0
@@ -148,6 +154,8 @@ def build_model_meta(depth, n_kv_head_override=None, attn_kind_override=None):
         sequence_len=args.max_seq_len, vocab_size=vocab_size,
         n_layer=depth, n_head=num_heads, n_kv_head=n_kv_head, n_embd=model_dim,
         window_pattern=args.window_pattern, attn_kind=attn_kind,
+        bqa_init_mass_k=args.bqa_init_mass_k,
+        bqa_init_mass_v=args.bqa_init_mass_v,
     )
     with torch.device("meta"):
         model_meta = GPT(config)
@@ -324,6 +332,10 @@ optimizer = model.setup_optimizer(
     # Muon hyperparameters
     matrix_lr=args.matrix_lr * batch_lr_scale,
     weight_decay=weight_decay_scaled,
+    # BQA alpha-group AdamW overrides
+    alpha_lr_mult=args.alpha_lr_mult,
+    alpha_beta1=args.alpha_beta1,
+    alpha_wd=args.alpha_wd,
 )
 
 if resuming:
