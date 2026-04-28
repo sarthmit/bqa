@@ -31,12 +31,35 @@ class GPTConfig:
     vocab_size: int = 32768
     n_layer: int = 12
     n_head: int = 6 # number of query heads
-    n_kv_head: int = 6 # number of key/value heads (GQA)
+    n_kv_head: int = 6 # number of key/value heads (GQA) / basis K/V heads (BQA)
     n_embd: int = 768
+    # Attention kind:
+    #   "gqa"      — Grouped-Query Attention: query head i attends to basis K/V head (i // group_size)
+    #   "bqa"      — Basis Query Attention: each query head attends to a learned softmax mixture
+    #                of all n_kv_head basis K/V heads (alpha logits, shape (n_head, n_kv_head)).
+    #                At init, alpha is set so BQA recovers GQA exactly; training can then deviate.
+    #   "bqa_dyn"  — Per-query logit-mix BQA: mixing logits are produced per token by a small
+    #                Linear `alpha_proj(x)` plus a learned static bias `b_alpha`. Each query
+    #                position picks its own basis combination, applied to *every* past key.
+    #                Implemented by materializing per-pair basis scores S[b,h,t,s,j] and
+    #                summing across j with w[b,t,h,j] BEFORE softmax — single softmax per
+    #                (t,h), unlike Mixture-of-Softmaxes. See DynamicBasisQueryAttention.
+    attn_kind: str = "gqa"
     # Sliding window attention pattern string, tiled across layers. Final layer always L.
     # Characters: L=long (full context), S=short (quarter context)
     # Examples: "L"=all full context, "SL"=alternating, "SSL"=two short then one long
     window_pattern: str = "SSSL"
+
+    @property
+    def cache_kv_heads(self):
+        """Number of K/V heads stored in the inference KV cache.
+        For GQA the cache is sized to the (smaller) basis count; for BQA the cache holds
+        the post-mix K/V, which has full n_head heads.
+        For bqa_dyn the cache would need to store basis K/V (mix is per-query at inference
+        time), but inference cache is not yet implemented for bqa_dyn — training-only."""
+        if self.attn_kind == "bqa":
+            return self.n_head
+        return self.n_kv_head
 
 
 def norm(x):
@@ -126,6 +149,200 @@ class CausalSelfAttention(nn.Module):
         return y
 
 
+class BasisQueryAttention(nn.Module):
+    """
+    Basis Query Attention (BQA) — a strict generalisation of GQA.
+
+    GQA assigns each query head to one of n_kv_head basis K/V heads (groups of size
+    n_head // n_kv_head share K/V). BQA replaces that hard assignment with a learned
+    convex combination, with *independent* mixings for K and V: parameters
+    `alpha_k`, `alpha_v` of shape (n_head, n_kv_head) are each softmaxed along the
+    basis dimension to produce w_k[h, j], w_v[h, j], and query head h attends to
+    K_h = sum_j w_k[h,j] * K_basis[j], V_h = sum_j w_v[h,j] * V_basis[j].
+
+    Recovers GQA exactly when both alpha_k and alpha_v are one-hot on the assigned
+    basis (the init we use here, with high logits on the assigned head). After mixing,
+    attention runs as full MHA over n_head heads — so the inference KV cache stores
+    the post-mix K/V of shape (B, T, n_head, head_dim), not the basis.
+    (See GPTConfig.cache_kv_heads.)
+    """
+    def __init__(self, config, layer_idx):
+        super().__init__()
+        self.layer_idx = layer_idx
+        self.n_head = config.n_head
+        self.n_kv_head = config.n_kv_head
+        self.n_embd = config.n_embd
+        self.head_dim = self.n_embd // self.n_head
+        assert self.n_embd % self.n_head == 0
+        assert self.n_kv_head <= self.n_head and self.n_head % self.n_kv_head == 0
+        self.c_q = Linear(self.n_embd, self.n_head * self.head_dim, bias=False)
+        self.c_k = Linear(self.n_embd, self.n_kv_head * self.head_dim, bias=False)
+        self.c_v = Linear(self.n_embd, self.n_kv_head * self.head_dim, bias=False)
+        self.c_proj = Linear(self.n_embd, self.n_embd, bias=False)
+        # Independent K/V mixing logits over basis heads. Real init in GPT.init_weights.
+        self.alpha_k = nn.Parameter(torch.zeros(self.n_head, self.n_kv_head))
+        self.alpha_v = nn.Parameter(torch.zeros(self.n_head, self.n_kv_head))
+        # ve gating is shaped per basis head (same as GQA) — ve fuses into V_basis pre-mix.
+        self.ve_gate_channels = 12
+        self.ve_gate = Linear(self.ve_gate_channels, self.n_kv_head, bias=False) if has_ve(layer_idx, config.n_layer) else None
+
+    def forward(self, x, ve, cos_sin, window_size, kv_cache):
+        B, T, C = x.size()
+
+        # Mix at the WEIGHT level rather than the activation level: by linearity,
+        #   sum_j w[h,j] * (W_basis_j @ x) == (sum_j w[h,j] W_basis_j) @ x
+        # so we can fold the basis combination into an effective per-query-head
+        # weight matrix (computed once per forward), then run a normal Linear.
+        # This avoids the activation-level einsum 'hj,btjd->bthd' whose backward
+        # has a degenerate dw reduction over (B*T*D) into a tiny (n_head*n_kv_head)
+        # output — bf16 split-K + atomic accumulate — which was ~17x slower than
+        # MHA in fwd+bwd on A100. (See scripts/bqa_bench.py.)
+        # Mix in fp32 for stability (matches the original alpha.float() softmax),
+        # then cast the effective weight to x.dtype right before F.linear — same
+        # pattern as nanochat's custom Linear (which keeps .weight in fp32 and
+        # casts at call time so the optimizer can update in fp32).
+        w_k = F.softmax(self.alpha_k.float(), dim=-1)  # (n_head, n_kv_head), fp32
+        w_v = F.softmax(self.alpha_v.float(), dim=-1)  # (n_head, n_kv_head), fp32
+        Wk_basis = self.c_k.weight.float().view(self.n_kv_head, self.head_dim, self.n_embd)
+        Wv_basis = self.c_v.weight.float().view(self.n_kv_head, self.head_dim, self.n_embd)
+        Wk_eff = torch.einsum('hj,jde->hde', w_k, Wk_basis).reshape(self.n_head * self.head_dim, self.n_embd)
+        Wv_eff = torch.einsum('hj,jde->hde', w_v, Wv_basis).reshape(self.n_head * self.head_dim, self.n_embd)
+
+        q = self.c_q(x).view(B, T, self.n_head, self.head_dim)
+        k = F.linear(x, Wk_eff.to(x.dtype)).view(B, T, self.n_head, self.head_dim)
+        v = F.linear(x, Wv_eff.to(x.dtype)).view(B, T, self.n_head, self.head_dim)
+
+        # Value residual is per-position (depends on token id and gate(x)), so it
+        # can't fold into the effective weight. We still mix the gated ve through
+        # the V basis combination, but only on layers that have ve.
+        if ve is not None:
+            ve = ve.view(B, T, self.n_kv_head, self.head_dim)
+            gate = 3 * torch.sigmoid(self.ve_gate(x[..., :self.ve_gate_channels]))  # (B, T, n_kv_head)
+            v = v + torch.einsum('hj,btj,btjd->bthd', w_v.to(x.dtype), gate, ve)
+
+        # Rotary + QK norm + attention (identical to MHA from here on).
+        cos, sin = cos_sin
+        q, k = apply_rotary_emb(q, cos, sin), apply_rotary_emb(k, cos, sin)
+        q, k = norm(q), norm(k)
+        q = q * 1.2
+        k = k * 1.2
+
+        if kv_cache is None:
+            y = flash_attn.flash_attn_func(q, k, v, causal=True, window_size=window_size)
+        else:
+            # Cache stores post-mix K/V at full n_head shape (see GPTConfig.cache_kv_heads).
+            k_cache, v_cache = kv_cache.get_layer_cache(self.layer_idx)
+            y = flash_attn.flash_attn_with_kvcache(
+                q, k_cache, v_cache,
+                k=k, v=v,
+                cache_seqlens=kv_cache.cache_seqlens,
+                causal=True,
+                window_size=window_size,
+            )
+            if self.layer_idx == kv_cache.n_layers - 1:
+                kv_cache.advance(T)
+
+        y = y.contiguous().view(B, T, -1)
+        y = self.c_proj(y)
+        return y
+
+
+class DynamicBasisQueryAttention(nn.Module):
+    """
+    Per-query logit-mix BQA. Each query position t produces its own mixing distribution
+    w[t, h, :] over the n_kv_head basis K/V heads via softmax(alpha_proj(x_t) + b_alpha).
+    Effective per-query K/V are then  K_eff[t,s,h] = Σ_j w[t,h,j] · K_basis[s,j], so the
+    mix depends on BOTH the query position (via w) and the key position (via K_basis).
+    A SINGLE softmax over s is applied to the w-mixed scores — this is *not* mixture-of-
+    softmaxes (which would softmax J times then mix outputs). See the BQA paper-style
+    derivation in scripts/bqa_bench.py / training notes.
+
+    Implementation: materialize basis scores S[b,h,t,s,j] = ⟨Q[b,t,h], K_basis[b,s,j]⟩,
+    collapse with w to per-pair scores, softmax, then aggregate V by the linearity-factored
+    form O[t,h] = Σ_j w[t,h,j] · (Σ_s p[t,s,h] · V_basis[s,j]). Memory of S is
+    (B, H, T, T, J) — sized so this fits on one A100 80GB at d=12, J=3 with B≤8 (no
+    activation checkpointing needed). For larger configs reduce --device-batch-size.
+    """
+    def __init__(self, config, layer_idx):
+        super().__init__()
+        self.layer_idx = layer_idx
+        self.n_head = config.n_head
+        self.n_kv_head = config.n_kv_head
+        self.n_embd = config.n_embd
+        self.head_dim = self.n_embd // self.n_head
+        assert self.n_embd % self.n_head == 0
+        assert self.n_kv_head <= self.n_head and self.n_head % self.n_kv_head == 0
+        self.c_q = Linear(self.n_embd, self.n_head * self.head_dim, bias=False)
+        self.c_k = Linear(self.n_embd, self.n_kv_head * self.head_dim, bias=False)
+        self.c_v = Linear(self.n_embd, self.n_kv_head * self.head_dim, bias=False)
+        self.c_proj = Linear(self.n_embd, self.n_embd, bias=False)
+        # Input-dependent mixing-logit projection. Init to zero so step-0 logits = b_alpha.
+        self.alpha_proj = Linear(self.n_embd, self.n_head * self.n_kv_head, bias=False)
+        # Static bias on mixing logits — initialized in GPT.init_weights to recover GQA.
+        self.b_alpha = nn.Parameter(torch.zeros(self.n_head, self.n_kv_head))
+        # ve gating shaped per basis head (same as GQA) — ve fuses into V_basis pre-mix
+        # since the ve contribution is per-key-position and basis-indexed.
+        self.ve_gate_channels = 12
+        self.ve_gate = Linear(self.ve_gate_channels, self.n_kv_head, bias=False) if has_ve(layer_idx, config.n_layer) else None
+
+    def forward(self, x, ve, cos_sin, window_size, kv_cache):
+        if kv_cache is not None:
+            raise NotImplementedError("bqa_dyn does not yet support inference KV cache")
+        B, T, C = x.size()
+        H, J, D = self.n_head, self.n_kv_head, self.head_dim
+
+        # Per-query mixing weights. softmax in fp32 for stability, cast to compute dtype.
+        alpha_logits = self.alpha_proj(x).view(B, T, H, J) + self.b_alpha
+        w = F.softmax(alpha_logits.float(), dim=-1).to(x.dtype)  # (B, T, H, J)
+
+        # Standard projections.
+        q = self.c_q(x).view(B, T, H, D)
+        k_basis = self.c_k(x).view(B, T, J, D)
+        v_basis = self.c_v(x).view(B, T, J, D)
+
+        # ve residual is per-key-position and basis-indexed → folds into V_basis directly,
+        # before the dynamic mix (this is identical to static-BQA's handling).
+        if ve is not None:
+            ve = ve.view(B, T, J, D)
+            gate = 3 * torch.sigmoid(self.ve_gate(x[..., :self.ve_gate_channels]))  # (B, T, J)
+            v_basis = v_basis + gate.unsqueeze(-1) * ve
+
+        # Rotary on q (per query position) and k_basis (per key position). QK norm + ×1.2.
+        cos, sin = cos_sin
+        q = apply_rotary_emb(q, cos, sin)
+        k_basis = apply_rotary_emb(k_basis, cos, sin)
+        q = norm(q) * 1.2
+        k_basis = norm(k_basis) * 1.2
+
+        scale = 1.0 / (self.head_dim ** 0.5)
+        # (1) Per-pair basis scores. Memory: (B, H, T, T, J).
+        # S[b, h, t, s, j] = ⟨Q[b, t, h], K_basis[b, s, j]⟩
+        S = torch.einsum('bthd,bsjd->bhtsj', q, k_basis) * scale
+        # (2) Mix with per-query w to get a single score per (t, s, h).
+        score = torch.einsum('bhtsj,bthj->bhts', S, w)
+
+        # (3) Causal + sliding-window mask, then softmax over key positions.
+        device = score.device
+        row = torch.arange(T, device=device).view(-1, 1)
+        col = torch.arange(T, device=device).view(1, -1)
+        mask = col <= row
+        win = window_size[0]
+        if win >= 0 and win < T:
+            mask = mask & ((row - col) <= win)
+        score = score.masked_fill(~mask, float('-inf'))
+        p = F.softmax(score, dim=-1)  # (B, H, T, T)
+
+        # (4) V aggregation, factored: J p-weighted sums of V_basis, then per-query mix.
+        # O'[b, t, h, j, d] = Σ_s p[b, h, t, s] · V_basis[b, s, j, d]
+        O_prime = torch.einsum('bhts,bsjd->bthjd', p, v_basis)
+        # O[b, t, h, d] = Σ_j w[b, t, h, j] · O'[b, t, h, j, d]
+        y = torch.einsum('bthj,bthjd->bthd', w, O_prime)
+
+        y = y.contiguous().view(B, T, -1)
+        y = self.c_proj(y)
+        return y
+
+
 class MLP(nn.Module):
     def __init__(self, config):
         super().__init__()
@@ -139,10 +356,20 @@ class MLP(nn.Module):
         return x
 
 
+def make_attention(config, layer_idx):
+    if config.attn_kind == "gqa":
+        return CausalSelfAttention(config, layer_idx)
+    if config.attn_kind == "bqa":
+        return BasisQueryAttention(config, layer_idx)
+    if config.attn_kind == "bqa_dyn":
+        return DynamicBasisQueryAttention(config, layer_idx)
+    raise ValueError(f"Unknown attn_kind: {config.attn_kind!r} (expected 'gqa', 'bqa', or 'bqa_dyn')")
+
+
 class Block(nn.Module):
     def __init__(self, config, layer_idx):
         super().__init__()
-        self.attn = CausalSelfAttention(config, layer_idx)
+        self.attn = make_attention(config, layer_idx)
         self.mlp = MLP(config)
 
     def forward(self, x, ve, cos_sin, window_size, kv_cache):
@@ -251,6 +478,35 @@ class GPT(nn.Module):
         for block in self.transformer.h:
             if block.attn.ve_gate is not None:
                 torch.nn.init.uniform_(block.attn.ve_gate.weight, 0.0, 0.02)
+
+        # BQA mixing logits: GQA-leaning init. Each query head gets a higher logit
+        # on its assigned basis head (same assignment GQA would use), so softmax(alpha)
+        # is biased toward that basis at step 0. Training is then free to deviate.
+        # Logit 1.0 (J=3) → softmax ≈ 0.58/0.21/0.21: weaker GQA bias than 2.0
+        # (which gave ≈0.84/0.08/0.08), giving alpha more room to move during
+        # training. Earlier 5.0 saturated to ≈0.99 with vanishing local gradient.
+        if self.config.attn_kind == "bqa":
+            n_head, n_kv_head = self.config.n_head, self.config.n_kv_head
+            assert n_head % n_kv_head == 0
+            group_size = n_head // n_kv_head
+            for block in self.transformer.h:
+                for a in (block.attn.alpha_k, block.attn.alpha_v):
+                    torch.nn.init.zeros_(a)
+                    for h in range(n_head):
+                        a.data[h, h // group_size] = 1.0
+
+        # bqa_dyn: same GQA-leaning bias on b_alpha; alpha_proj weights start at zero
+        # so step-0 logits are exactly b_alpha (matches static BQA init).
+        if self.config.attn_kind == "bqa_dyn":
+            n_head, n_kv_head = self.config.n_head, self.config.n_kv_head
+            assert n_head % n_kv_head == 0
+            group_size = n_head // n_kv_head
+            for block in self.transformer.h:
+                torch.nn.init.zeros_(block.attn.alpha_proj.weight)
+                b = block.attn.b_alpha
+                torch.nn.init.zeros_(b)
+                for h in range(n_head):
+                    b.data[h, h // group_size] = 1.0
 
         # Rotary embeddings
         head_dim = self.config.n_embd // self.config.n_head
@@ -376,14 +632,24 @@ class GPT(nn.Module):
         ddp, rank, local_rank, world_size = get_dist_info()
 
         # Separate out all parameters into groups
-        matrix_params = list(self.transformer.h.parameters())
+        # BQA's logit tensors (`alpha_k`/`alpha_v` for static BQA, `b_alpha` for bqa_dyn)
+        # are *not* linear operators — they're tensors of independent logits — so they
+        # don't belong in the Muon bucket (Newton-Schulz on logits scrambles them) and
+        # must not get the matrix-group weight decay (which would pull softmax toward
+        # uniform). Pull them out of `transformer.h` into a dedicated AdamW group with
+        # no WD. Note: `alpha_proj.weight` (bqa_dyn) IS a real linear-operator weight
+        # and stays in the matrix/Muon bucket as usual.
+        def _is_alpha_logit(name):
+            return name.endswith(".alpha_k") or name.endswith(".alpha_v") or name.endswith(".b_alpha")
+        alpha_params = [p for n, p in self.transformer.h.named_parameters() if _is_alpha_logit(n)]
+        matrix_params = [p for n, p in self.transformer.h.named_parameters() if not _is_alpha_logit(n)]
         value_embeds_params = list(self.value_embeds.parameters())
         embedding_params = list(self.transformer.wte.parameters())
         lm_head_params = list(self.lm_head.parameters())
         resid_params = [self.resid_lambdas]
         x0_params = [self.x0_lambdas]
         smear_params = [self.smear_gate.weight, self.smear_lambda, self.backout_lambda]
-        assert len(list(self.parameters())) == len(matrix_params) + len(embedding_params) + len(lm_head_params) + len(value_embeds_params) + len(resid_params) + len(x0_params) + len(smear_params)
+        assert len(list(self.parameters())) == len(matrix_params) + len(alpha_params) + len(embedding_params) + len(lm_head_params) + len(value_embeds_params) + len(resid_params) + len(x0_params) + len(smear_params)
 
         # Scale the LR for the AdamW parameters by ∝1/√dmodel (tuned for 768 dim model)
         dmodel_lr_scale = (model_dim / 768) ** -0.5
@@ -399,6 +665,15 @@ class GPT(nn.Module):
             dict(kind='adamw', params=x0_params, lr=scalar_lr, betas=(0.96, 0.95), eps=1e-10, weight_decay=0.0),  # higher beta1 for x0
             dict(kind='adamw', params=smear_params, lr=0.2, betas=(0.8, 0.95), eps=1e-10, weight_decay=0.0),
         ]
+        # BQA mixing logits (static `alpha_k`/`alpha_v` and bqa_dyn's `b_alpha`): tiny tensors,
+        # AdamW with no weight decay so the GQA-recovering init isn't slowly pulled
+        # toward uniform. LR matches the embedding scale.
+        if alpha_params:
+            param_groups.append(
+                dict(kind='adamw', params=alpha_params,
+                     lr=embedding_lr * dmodel_lr_scale, betas=(0.9, 0.95),
+                     eps=1e-10, weight_decay=0.0)
+            )
         # Muon groups (matrix params, grouped by shape for stacking)
         for shape in sorted({p.shape for p in matrix_params}):
             group_params = [p for p in matrix_params if p.shape == shape]

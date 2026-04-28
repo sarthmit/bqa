@@ -23,6 +23,7 @@ from contextlib import contextmanager
 
 import wandb
 import torch
+import torch.nn.functional as F
 import torch.distributed as dist
 
 from nanochat.gpt import GPT, GPTConfig, Linear
@@ -50,6 +51,8 @@ parser.add_argument("--fp8-recipe", type=str, default="tensorwise", choices=["ro
 parser.add_argument("--depth", type=int, default=20, help="depth of the Transformer model")
 parser.add_argument("--aspect-ratio", type=int, default=64, help="model_dim = depth * aspect_ratio")
 parser.add_argument("--head-dim", type=int, default=128, help="target head dimension for attention")
+parser.add_argument("--n-kv-head", type=int, default=-1, help="number of key/value heads for GQA / basis K/V heads for BQA. -1 (default) = n_head/2 (2:1 ratio). Pass n_head explicitly for MHA. Must divide n_head.")
+parser.add_argument("--attn-kind", type=str, default="gqa", choices=["gqa", "bqa", "bqa_dyn"], help="attention kind: 'gqa' (grouped-query, default), 'bqa' (basis-query, static per-layer mixing logits), or 'bqa_dyn' (per-query mixing logits = alpha_proj(x) + b_alpha, single softmax over a w-mixed score).")
 parser.add_argument("--max-seq-len", type=int, default=2048, help="max context length")
 parser.add_argument("--window-pattern", type=str, default="SSSL", help="sliding window pattern tiled across layers: L=full, S=half context (e.g. 'SSL')")
 # Training horizon (only one used, in order of precedence)
@@ -126,17 +129,25 @@ print0(f"Vocab size: {vocab_size:,}")
 # -----------------------------------------------------------------------------
 # Initialize the Model
 
-def build_model_meta(depth):
-    """Build a model on meta device for a given depth (shapes/dtypes only, no data)."""
+def build_model_meta(depth, n_kv_head_override=None, attn_kind_override=None):
+    """Build a model on meta device for a given depth (shapes/dtypes only, no data).
+
+    The override args let callers (e.g. the d12 reference used for scaling-law math)
+    bypass user CLI choices that may not divide cleanly at a different depth.
+    """
     # Model dim is nudged up to nearest multiple of head_dim for clean division
     # (FA3 requires head_dim divisible by 8, and this guarantees head_dim == args.head_dim exactly)
     base_dim = depth * args.aspect_ratio
     model_dim = ((base_dim + args.head_dim - 1) // args.head_dim) * args.head_dim
     num_heads = model_dim // args.head_dim
+    n_kv_head_arg = args.n_kv_head if n_kv_head_override is None else n_kv_head_override
+    n_kv_head = max(1, num_heads // 2) if n_kv_head_arg <= 0 else n_kv_head_arg
+    assert num_heads % n_kv_head == 0, f"n_head ({num_heads}) must be divisible by n_kv_head ({n_kv_head}). For odd n_head, override with --n-kv-head."
+    attn_kind = args.attn_kind if attn_kind_override is None else attn_kind_override
     config = GPTConfig(
         sequence_len=args.max_seq_len, vocab_size=vocab_size,
-        n_layer=depth, n_head=num_heads, n_kv_head=num_heads, n_embd=model_dim,
-        window_pattern=args.window_pattern,
+        n_layer=depth, n_head=num_heads, n_kv_head=n_kv_head, n_embd=model_dim,
+        window_pattern=args.window_pattern, attn_kind=attn_kind,
     )
     with torch.device("meta"):
         model_meta = GPT(config)
@@ -269,7 +280,7 @@ num_scaling_params = get_scaling_params(model)
 target_tokens = int(args.target_param_data_ratio * num_scaling_params) # optimal tokens for the model we are about to train
 
 # Our reference model is d12, this is where a lot of hyperparameters are tuned and then transfered to higher depths (muP style)
-d12_ref = build_model_meta(12) # creates the model on meta device
+d12_ref = build_model_meta(12, n_kv_head_override=-1, attn_kind_override="gqa") # fixed reference for scaling-law math, insensitive to CLI overrides
 D_REF = args.target_param_data_ratio * get_scaling_params(d12_ref) # compute-optimal d12 training horizon in tokens (measured empirically)
 B_REF = 2**19 # optimal batch size at d12 ~= 524,288 tokens (measured empirically)
 
@@ -577,6 +588,22 @@ while True:
             "train/mfu": mfu,
             "train/epoch": epoch,
         }
+        # BQA: log average softmax entropy of alpha_k / alpha_v across heads & layers.
+        # H_uniform = log(n_kv_head); H_one_hot = 0. Entropy ratio ∈ [0, 1] = H / log(J).
+        if orig_model.config.attn_kind == "bqa":
+            with torch.no_grad():
+                hk_sum, hv_sum, n_layers = 0.0, 0.0, 0
+                for block in orig_model.transformer.h:
+                    pk = F.softmax(block.attn.alpha_k.float(), dim=-1)
+                    pv = F.softmax(block.attn.alpha_v.float(), dim=-1)
+                    hk_sum += -(pk * pk.clamp_min(1e-12).log()).sum(dim=-1).mean().item()
+                    hv_sum += -(pv * pv.clamp_min(1e-12).log()).sum(dim=-1).mean().item()
+                    n_layers += 1
+                norm_factor = math.log(orig_model.config.n_kv_head)
+                log_data["bqa/H_alpha_k"] = hk_sum / n_layers
+                log_data["bqa/H_alpha_v"] = hv_sum / n_layers
+                log_data["bqa/H_alpha_k_ratio"] = (hk_sum / n_layers) / norm_factor
+                log_data["bqa/H_alpha_v_ratio"] = (hv_sum / n_layers) / norm_factor
         wandb_run.log(log_data)
 
     # state update
