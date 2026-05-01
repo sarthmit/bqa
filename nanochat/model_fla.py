@@ -676,22 +676,64 @@ class FLATransformer(nn.Module):
                 if isinstance(block.attn, _GDNAttention):
                     _cast_conv1d_to_compute_dtype(block.attn.inner)
 
-    def setup_optimizer(self, lr: float = 3e-4, weight_decay: float = 0.1, betas=(0.9, 0.95)):
-        """Single AdamW group covering every parameter (one shared LR + WD).
+    def setup_optimizer(
+        self,
+        lr: float = 3e-4,
+        weight_decay: float = 0.1,
+        betas=(0.9, 0.95),
+        embedding_lr: float | None = None,
+        unembedding_lr: float | None = None,
+    ):
+        """AdamW with up-to-three param groups (embedding / lm_head / everything else).
 
-        Uses torch.optim.AdamW(fused=True) directly rather than MuonAdamW. nanochat's
-        MuonAdamW wraps the AdamW step with @torch.compile(dynamic=False) and recompiles
-        per-shape; with the variety of GDN param shapes (q/k/v/g/a/b/o_proj of differing
-        sizes, conv1d filters, A_log, dt_bias, o_norm) this triggered a >2.5x slowdown
-        compared to plain fused AdamW (verified on cn-g020: GDN d=12 hidden=768 B=4
-        T=8192 went from 437ms/step → 239ms/step). We don't need Muon here anyway since
-        none of the FLATransformer parameters are slated for Newton-Schulz orthogonalization.
+        Why three groups (vs the single-group setup we started with): nanochat's GPT
+        recipe uses very different LRs across parameter classes — `embedding_lr=0.3`
+        and `unembedding_lr=0.008` for wte/lm_head, `matrix_lr=0.02` for Muon-driven
+        matrix params. Lumping every fla param into one AdamW group at the matrix
+        rate (~2e-3) starves the embedding update by ~150× and the lm_head by ~4×;
+        on early-step loss curves this shows up as visibly slow learning. Setting
+        `embedding_lr` and `unembedding_lr` to the original high values lets the
+        embedding/unembedding catch up without destabilizing the matrix params.
+
+        Why not Muon: nanochat's MuonAdamW wraps the AdamW step with
+        @torch.compile(dynamic=False) and recompiles per-shape; with the variety of
+        GDN/MoE param shapes (q/k/v/g/a/b/o_proj of differing sizes, conv1d filters,
+        A_log, dt_bias, o_norm, expert weights) this triggered a >2.5× slowdown
+        compared to plain fused AdamW. None of the fla parameters are obvious
+        Newton-Schulz candidates, so plain AdamW is the right tool.
+
+        If both `embedding_lr` and `unembedding_lr` are None, all params share `lr`
+        (single-group, back-compat with smoke-test callers).
         """
-        optimizer = torch.optim.AdamW(
-            self.parameters(),
-            lr=lr, betas=betas, eps=1e-10, weight_decay=weight_decay,
-            fused=True,
-        )
+        if embedding_lr is None and unembedding_lr is None:
+            optimizer = torch.optim.AdamW(
+                self.parameters(),
+                lr=lr, betas=betas, eps=1e-10, weight_decay=weight_decay,
+                fused=True,
+            )
+        else:
+            wte_params = list(self.wte.parameters())
+            lm_head_params = list(self.lm_head.parameters())
+            wte_ids = {id(p) for p in wte_params} | {id(p) for p in lm_head_params}
+            matrix_params = [p for p in self.parameters() if id(p) not in wte_ids]
+            assert (len(wte_params) + len(lm_head_params) + len(matrix_params)
+                    == len(list(self.parameters()))), "param group split missed parameters"
+            param_groups = [
+                # Embedding gets the high LR + low WD per nanochat's recipe.
+                dict(params=wte_params,
+                     lr=embedding_lr if embedding_lr is not None else lr,
+                     weight_decay=0.001),
+                # lm_head: small LR with mild WD.
+                dict(params=lm_head_params,
+                     lr=unembedding_lr if unembedding_lr is not None else lr,
+                     weight_decay=0.01),
+                # Everything else (transformer matrices, MoE experts/router, GDN
+                # convs/A_log/dt_bias/o_norm, attention projs/q_norm/k_norm).
+                dict(params=matrix_params, lr=lr, weight_decay=weight_decay),
+            ]
+            optimizer = torch.optim.AdamW(
+                param_groups, betas=betas, eps=1e-10, fused=True,
+            )
         # base_train.py's lr scheduler reads `initial_lr` per group to compute
         # `group["lr"] = group["initial_lr"] * lrm` at every step. Stamp it now.
         for g in optimizer.param_groups:

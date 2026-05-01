@@ -404,9 +404,18 @@ if weight_decay_scaled != args.weight_decay:
 # - --model-kind=fla → single AdamW group covering every parameter, one shared LR + WD.
 #                     Reuses the same warmup/warmdown scheduler below.
 if args.model_kind == "fla":
+    # Three AdamW groups matching nanochat's GPT recipe:
+    #   * wte:     embedding_lr * dmodel_lr_scale * batch_lr_scale (high; default 0.3)
+    #   * lm_head: unembedding_lr * dmodel_lr_scale * batch_lr_scale (default 0.008)
+    #   * matrix:  gdn_lr * batch_lr_scale (AdamW-appropriate; default 0.002)
+    # Without the per-group LRs the wte param starves at the matrix rate (~150×
+    # too small) and early-step loss visibly trails the GPT path.
+    fla_dmodel_scale = (model.config.n_embd / 768) ** -0.5
     optimizer = model.setup_optimizer(
-        lr=args.gdn_lr * batch_lr_scale,  # reuse --gdn-lr as the single AdamW LR (default 0.002)
+        lr=args.gdn_lr * batch_lr_scale,
         weight_decay=args.gdn_wd,
+        embedding_lr=args.embedding_lr * fla_dmodel_scale * batch_lr_scale,
+        unembedding_lr=args.unembedding_lr * fla_dmodel_scale * batch_lr_scale,
     )
 else:
     optimizer = model.setup_optimizer(
