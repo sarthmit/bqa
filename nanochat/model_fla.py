@@ -376,15 +376,39 @@ def _make_attn(config: FLAConfig, layer_idx: int) -> nn.Module:
 
 
 class _MLP(nn.Module):
-    """ReLU² up/down — matches the existing nanochat MLP. SwiGLU is a one-line swap."""
+    """Pre-norm SwiGLU FFN — the dominant FFN pattern in modern LLMs (LLaMA, Mistral,
+    Qwen, DeepSeek, Mixtral, Phi-3, ...) since Shazeer 2020:
+        down_proj(silu(gate_proj(x)) * up_proj(x))
+
+    Hidden dim = 4·n_embd (matches the prior ReLU² FFN size — three matmuls instead
+    of two trade extra parameters for the empirically-better gated activation; we
+    keep this size for direct comparability rather than dropping to LLaMA's
+    parameter-equivalent 8/3·n_embd).
+
+    Same module also serves as a single MoE expert — see _MoEMLP.
+    """
 
     def __init__(self, config: FLAConfig):
         super().__init__()
-        self.c_fc = Linear(config.n_embd, 4 * config.n_embd, bias=False)
-        self.c_proj = Linear(4 * config.n_embd, config.n_embd, bias=False)
+        n_embd = config.n_embd
+        hidden = 4 * n_embd
+        self.gate_proj = Linear(n_embd, hidden, bias=False)
+        self.up_proj = Linear(n_embd, hidden, bias=False)
+        self.down_proj = Linear(hidden, n_embd, bias=False)
+        self.hidden = hidden
 
     def forward(self, x):
-        return self.c_proj(F.relu(self.c_fc(x)).square())
+        return self.down_proj(F.silu(self.gate_proj(x)) * self.up_proj(x))
+
+    @torch.no_grad()
+    def reset_parameters(self, s: float):
+        """Init: gate and up get the modest `s * 0.4` uniform (activation-explosion
+        control, matches nanochat/gpt.py's c_fc init scale); down is zero-init for
+        residual stability so each block starts at identity in the residual stream.
+        """
+        nn.init.uniform_(self.gate_proj.weight, -s * 0.4, s * 0.4)
+        nn.init.uniform_(self.up_proj.weight, -s * 0.4, s * 0.4)
+        nn.init.zeros_(self.down_proj.weight)
 
 
 class _MoEMLP(nn.Module):
@@ -423,7 +447,6 @@ class _MoEMLP(nn.Module):
     def __init__(self, config: FLAConfig):
         super().__init__()
         self.n_embd = config.n_embd
-        self.expand = 4 * config.n_embd
         self.num_experts = config.moe_num_experts
         self.top_k = config.moe_top_k
         if not 1 <= self.top_k <= self.num_experts:
@@ -436,20 +459,27 @@ class _MoEMLP(nn.Module):
         # Linear keeps the master weight in fp32 (good for the explicit float() cast
         # of the logits below).
         self.router = Linear(config.n_embd, self.num_experts, bias=False)
-        # Each expert is a (c_fc, c_proj) pair stored in parallel ModuleLists. Could
-        # be folded into a single (E, D, H) weight tensor with grouped GEMM for
-        # higher arithmetic intensity, but at small num_experts the per-expert loop
-        # is simpler and already does the ideal O(N·top_k) work.
-        self.experts_c_fc = nn.ModuleList(
-            [Linear(config.n_embd, self.expand, bias=False) for _ in range(self.num_experts)]
-        )
-        self.experts_c_proj = nn.ModuleList(
-            [Linear(self.expand, config.n_embd, bias=False) for _ in range(self.num_experts)]
-        )
+        # Each expert is its own _MLP — same kind (swiglu/relu2) as the dense MLP would
+        # be. Storing as a ModuleList of full _MLP instances (instead of separate per-
+        # weight ModuleLists) keeps the dispatch loop kind-agnostic: `y = experts[e](x_e)`
+        # works for both SwiGLU and ReLU². Could be folded into stacked (E, D, H)
+        # weight tensors with grouped GEMM for higher arithmetic intensity, but at small
+        # num_experts the per-expert loop is simpler and already does the ideal
+        # O(N · top_k) FFN work.
+        self.experts = nn.ModuleList([_MLP(config) for _ in range(self.num_experts)])
         # Communication slot for FLATransformer.forward to harvest the aux loss
         # after each forward call. Reset at the start of every forward; left as
         # None when not training or when lbl_loss_weight == 0.
         self._last_aux_loss = None
+
+    @torch.no_grad()
+    def reset_parameters(self, s: float):
+        """Init the router with a small uniform (zero would lock all tokens to expert 0
+        at step 0; small uniform breaks symmetry without overpowering the softmax).
+        Each expert's reset_parameters does the up-uniform + down-zero pattern."""
+        nn.init.uniform_(self.router.weight, -s * 0.1, s * 0.1)
+        for expert in self.experts:
+            expert.reset_parameters(s)
 
     def forward(self, x):
         B, T, D = x.size()
@@ -484,8 +514,7 @@ class _MoEMLP(nn.Module):
             if tok_idx.numel() == 0:
                 continue
             x_e = x_flat.index_select(0, tok_idx)
-            h = F.relu(self.experts_c_fc[e](x_e)).square()
-            y = self.experts_c_proj[e](h)
+            y = self.experts[e](x_e)  # SwiGLU or ReLU² per the expert's own kind
             out.index_add_(0, tok_idx, y * weight_e[tok_idx, None])
 
         # Auxiliary load-balancing loss. Only meaningful when training; skip in eval
@@ -620,18 +649,11 @@ class FLATransformer(nn.Module):
                 attn.reset_parameters(init_std=std)
             else:
                 raise AssertionError(f"unknown attn type {type(attn).__name__}")
-            # MLP / MoE init. Dense MLP gets the same uniform up-proj + zero down-proj
-            # treatment as nanochat/gpt.py. MoE has the same per-expert pattern, plus a
-            # small uniform init on the router (zero would lock all tokens to expert 0
-            # at step 0; small uniform breaks symmetry).
-            if isinstance(block.mlp, _MoEMLP):
-                nn.init.uniform_(block.mlp.router.weight, -s * 0.1, s * 0.1)
-                for c_fc, c_proj in zip(block.mlp.experts_c_fc, block.mlp.experts_c_proj):
-                    nn.init.uniform_(c_fc.weight, -s * 0.4, s * 0.4)
-                    nn.init.zeros_(c_proj.weight)
-            else:
-                nn.init.uniform_(block.mlp.c_fc.weight, -s * 0.4, s * 0.4)  # 0.4× scale on the up-proj (matches gpt.py)
-                nn.init.zeros_(block.mlp.c_proj.weight)
+            # MLP / MoE init delegated to each module's reset_parameters. _MLP handles
+            # both swiglu (gate/up uniform, down zeros) and relu2 (c_fc uniform, c_proj
+            # zeros); _MoEMLP additionally inits a small uniform router and recurses
+            # into each expert's reset_parameters.
+            block.mlp.reset_parameters(s)
 
         # Refresh the rotary buffers on the real device after to_empty().
         head_dim = cfg.n_embd // cfg.n_head
