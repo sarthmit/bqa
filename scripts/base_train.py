@@ -72,10 +72,11 @@ parser.add_argument("--alpha", type=float, default=0.5, help="Hybrid mode (--mod
 #     conv1d / o_norm.weight) inside MuonAdamW.
 #   * --model-kind=fla: every parameter except wte / lm_head (attention projs, MoE
 #     experts/router, GDN tensors, MLP gate/up/down).
-# Default 0.003 / 0.1 are AdamW-tuned for transformer matrices at d=12 hidden=768
-# — NOT comparable to the Muon-tuned --matrix-lr (which is intrinsically higher
-# because Newton-Schulz orthogonalizes the update).
-parser.add_argument("--fla-lr", type=float, default=0.003, help="AdamW LR for non-Muon param groups: GDN-specific group in the GPT path, or the matrix group in the fla path. AdamW-tuned default — much smaller than --matrix-lr (which is Muon-tuned).")
+# Default 0.002 / 0.1 are AdamW-tuned for transformer matrices at d=12 hidden=768
+# (0.003 was tested and showed early-step loss instability) — NOT comparable to
+# the Muon-tuned --matrix-lr (which is intrinsically higher because Newton-Schulz
+# orthogonalizes the update).
+parser.add_argument("--fla-lr", type=float, default=0.002, help="AdamW LR for non-Muon param groups: GDN-specific group in the GPT path, or the matrix group in the fla path. AdamW-tuned default — much smaller than --matrix-lr (which is Muon-tuned). 0.003 was tested and showed step-14 loss instability; 0.002 is the stable default.")
 parser.add_argument("--fla-wd", type=float, default=0.1, help="AdamW weight_decay for non-Muon param groups (same scope as --fla-lr).")
 # Mixture-of-Experts FFN (only meaningful with --model-kind=fla; replaces every block's
 # dense MLP with a token-routed top-k MoE; orthogonal to --attn-kind so combines freely
@@ -412,18 +413,16 @@ if weight_decay_scaled != args.weight_decay:
 # - --model-kind=fla → single AdamW group covering every parameter, one shared LR + WD.
 #                     Reuses the same warmup/warmdown scheduler below.
 if args.model_kind == "fla":
-    # Three AdamW groups matching nanochat's GPT recipe:
-    #   * wte:     embedding_lr * dmodel_lr_scale * batch_lr_scale (high; default 0.3)
-    #   * lm_head: unembedding_lr * dmodel_lr_scale * batch_lr_scale (default 0.008)
-    #   * matrix:  fla_lr * batch_lr_scale (AdamW-tuned; default 0.003)
-    # Without the per-group LRs the wte param starves at the matrix rate (~150×
-    # too small) and early-step loss visibly trails the GPT path.
-    fla_dmodel_scale = (model.config.n_embd / 768) ** -0.5
+    # Single AdamW group covering every parameter (one shared LR + WD). We tried
+    # nanochat's per-group recipe (wte at 0.3, lm_head at 0.008, matrix at fla_lr)
+    # but it produced visibly worse training than the single-group baseline — the
+    # nanochat recipe is calibrated for GPT's wte init (std=0.8) and Muon-driven
+    # matrix updates; in the fla path with std=0.02 wte init and AdamW everywhere,
+    # the high embedding LR appears to destabilize learning. Sticking with single-
+    # group AdamW.
     optimizer = model.setup_optimizer(
         lr=args.fla_lr * batch_lr_scale,
         weight_decay=args.fla_wd,
-        embedding_lr=args.embedding_lr * fla_dmodel_scale * batch_lr_scale,
-        unembedding_lr=args.unembedding_lr * fla_dmodel_scale * batch_lr_scale,
     )
 else:
     optimizer = model.setup_optimizer(
