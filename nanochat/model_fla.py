@@ -694,21 +694,39 @@ class FLATransformer(nn.Module):
         return optimizer
 
     def estimate_flops(self):
-        """Coarse FLOPs/token estimate for MFU logging. Counts only matmul FLOPs in the
-        transformer matrices (excludes embeddings/lm_head). For the attention term we
-        only add the quadratic-in-T cost for MHA layers; GDN's recurrence is O(T) per
-        layer and folded into the 6·N matmul accounting. Hybrid mode counts the MHA
-        contribution per non-GDN layer.
+        """Coarse FLOPs/token estimate for MFU logging and `--target-flops` budgeting.
+        Counts the matmul FLOPs that actually run *per token*:
+          * Attention/projection params: every block contributes its attn params.
+          * Dense MLP: every param contributes (the 6N rule).
+          * MoE MLP: only `top_k` of `num_experts` experts run per token, plus the
+            (tiny) router. Without this correction `--target-flops` would over-budget
+            MoE by ~num_experts/top_k (we'd train for ~4× too few steps at 8/2).
+          * Attention quadratic: 12·H·D·T per MHA layer (FA-style — Q@K + soft@V);
+            GDN's recurrence is O(T) per layer and absorbed into the 6N count.
+        Embeddings and the lm_head are excluded — same convention as nanochat/gpt.py.
         """
-        nparams = sum(p.numel() for p in self.parameters())
-        nparams_exclude = self.wte.weight.numel() + self.lm_head.weight.numel()
         cfg = self.config
         h = cfg.n_head
         d = cfg.n_embd // h
         t = cfg.sequence_len
+
+        nparams_active = 0
+        for block in self.h:
+            for p in block.attn.parameters():
+                nparams_active += p.numel()
+            if isinstance(block.mlp, _MoEMLP):
+                # router runs once per token regardless of top_k
+                nparams_active += block.mlp.router.weight.numel()
+                # only top_k experts run per token; experts are homogeneous so we
+                # count the param count of expert 0 and scale.
+                nparams_active += block.mlp.top_k * sum(p.numel() for p in block.mlp.experts[0].parameters())
+            else:
+                for p in block.mlp.parameters():
+                    nparams_active += p.numel()
+
         n_mha = len(self.mha_layer_indices())
-        attn_flops = n_mha * 12 * h * d * t  # FA-style 12·H·D·T per MHA layer per token
-        return 6 * (nparams - nparams_exclude) + attn_flops
+        attn_flops = n_mha * 12 * h * d * t
+        return 6 * nparams_active + attn_flops
 
     def num_scaling_params(self):
         """Param-count breakdown for scaling-law analysis. Mirrors the keys returned by
