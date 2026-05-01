@@ -69,6 +69,12 @@ parser.add_argument("--gdn-allow-neg-eigval", action="store_true", help="GDN: mu
 parser.add_argument("--alpha", type=float, default=0.5, help="Hybrid mode (--model-kind=fla --attn-kind=hybrid only): fraction of layers that are MHA, in [0, 1]. round(alpha * n_layer) MHA layers placed evenly across depth (Bresenham). 0.0 == all-GDN == --attn-kind=gdn; 1.0 == all-MHA == --attn-kind=gqa. Default 0.5 (alternating).")
 parser.add_argument("--gdn-lr", type=float, default=0.002, help="GDN: AdamW LR for the GDN module's parameters (linear projections + special tensors). The global warmup/warmdown schedule still applies on top.")
 parser.add_argument("--gdn-wd", type=float, default=0.1, help="GDN: AdamW weight_decay for the GDN linear-projection weights. Special tensors (A_log/dt_bias/o_norm/conv1d) always use WD=0.")
+# Mixture-of-Experts FFN (only meaningful with --model-kind=fla; replaces every block's
+# dense MLP with a token-routed top-k MoE; orthogonal to --attn-kind so combines freely
+# with mha / gdn / hybrid).
+parser.add_argument("--moe-num-experts", type=int, default=0, help="Number of MoE experts per block. 0 (default) = dense MLP. >0 enables MoE in every block of the FLATransformer.")
+parser.add_argument("--moe-top-k", type=int, default=2, help="Number of experts each token routes to (top-k of router logits). top_k=1 uses softmax→top1 to keep gradient on the chosen logit; top_k>1 uses topk→softmax (normalized over the picked k).")
+parser.add_argument("--moe-lbl-loss-weight", type=float, default=0.01, help="Switch-Transformer-style load-balancing aux loss weight, added to the main CE loss only at training time. 0 disables.")
 parser.add_argument("--seed", type=int, default=42, help="global torch seed for model init / dataloader shuffling. Same value used across all DDP ranks; non-determinism remains from cuDNN / flash-attn / fp8 kernels.")
 parser.add_argument("--max-seq-len", type=int, default=2048, help="max context length")
 parser.add_argument("--window-pattern", type=str, default="SSSL", help="sliding window pattern tiled across layers: L=full, S=half context (e.g. 'SSL')")
@@ -185,6 +191,9 @@ def build_model_meta(depth, n_kv_head_override=None, attn_kind_override=None):
             gdn_conv_size=args.gdn_conv_size,
             gdn_use_gate=not args.gdn_no_gate,
             gdn_allow_neg_eigval=args.gdn_allow_neg_eigval,
+            moe_num_experts=args.moe_num_experts,
+            moe_top_k=args.moe_top_k,
+            moe_lbl_loss_weight=args.moe_lbl_loss_weight,
         )
         with torch.device("meta"):
             model_meta = FLATransformer(fla_cfg)
@@ -193,6 +202,8 @@ def build_model_meta(depth, n_kv_head_override=None, attn_kind_override=None):
             gdn_idxs = model_meta.gdn_layer_indices()
             layout = "".join("M" if i in set(mha_idxs) else "G" for i in range(depth))
             print0(f"[fla:hybrid] alpha={args.alpha:.3f} → {len(mha_idxs)}/{depth} MHA, {len(gdn_idxs)}/{depth} GDN; layout {layout}")
+        if args.moe_num_experts > 0:
+            print0(f"[fla:moe] num_experts={args.moe_num_experts} top_k={args.moe_top_k} lbl_loss_weight={args.moe_lbl_loss_weight}")
         return model_meta
     n_kv_head_arg = args.n_kv_head if n_kv_head_override is None else n_kv_head_override
     n_kv_head = max(1, num_heads // 2) if n_kv_head_arg <= 0 else n_kv_head_arg

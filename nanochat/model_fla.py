@@ -89,6 +89,18 @@ class FLAConfig:
     gdn_conv_size: int = 4
     gdn_use_gate: bool = True
     gdn_allow_neg_eigval: bool = False
+    # Mixture-of-Experts FFN. When `moe_num_experts > 0` every block's MLP becomes a
+    # token-routed top-k MoE (replacing the dense ReLU² FFN). Routing pattern mirrors
+    # google-deepmind/simply MoEFeedForward (model_lib.py:642):
+    #   * top_k == 1 → softmax → top-1 (avoids zero gradient at the argmax)
+    #   * top_k > 1  → top-k of logits → softmax over the selected k (normalized)
+    # Each expert is its own ReLU² FFN with the same up/down shape as the dense MLP.
+    # A Switch-Transformer-style load-balancing auxiliary loss is added to the main
+    # loss with weight `moe_lbl_loss_weight` (computed only in training mode).
+    # `moe_num_experts == 0` (default) disables MoE and uses the dense MLP.
+    moe_num_experts: int = 0
+    moe_top_k: int = 2
+    moe_lbl_loss_weight: float = 0.01
 
 
 def _rms_norm(x):
@@ -375,13 +387,140 @@ class _MLP(nn.Module):
         return self.c_proj(F.relu(self.c_fc(x)).square())
 
 
+class _MoEMLP(nn.Module):
+    """Mixture-of-Experts FFN with token-specific top-k routing.
+
+    Pattern adapted from google-deepmind/simply MoEFeedForward
+    (model_lib.py:642): linear router → top_k → softmax over the selected k →
+    per-expert dispatch. Each expert is its own ReLU² up/down with the same
+    (n_embd, 4·n_embd) shape as the dense MLP — so a per-block MoE layer holds
+    `num_experts` × the FFN params, but each token only consumes top_k of them.
+
+    Routing modes (matching the simply convention exactly):
+      * top_k == 1 — softmax → top-1. Doing the topk after softmax avoids the
+                     zero-gradient pitfall at the argmax (the chosen logit's
+                     probability is a function of every other logit too).
+      * top_k > 1  — top_k → softmax. The selected logits are renormalized so
+                     the per-token expert weights sum to 1 over the picked
+                     experts; their ratios still depend on each other through
+                     the localized softmax, so all selected logits get gradient.
+
+    Dispatch: per-expert loop with `index_select` / `index_add_` — does exactly
+    O(N · top_k) Linear work in total (not O(N · num_experts)). Each expert e
+    pulls the tokens routed to it, runs its FFN, and writes weighted outputs
+    back into the residual buffer. No expert-capacity dropping (all tokens
+    are processed; suitable for the small num_experts setting).
+
+    Auxiliary load-balancing loss (Switch Transformer style;
+    https://arxiv.org/abs/2101.03961 §3): `lbl = num_experts · Σ_e f_e · P_e`
+    where `f_e = fraction of routings going to expert e` (no grad) and
+    `P_e = mean router probability for expert e` (grad flows through softmax,
+    so the router is pushed toward uniform when high-prob experts are also the
+    high-frequency ones). Stashed in `self._last_aux_loss` and consumed by
+    `FLATransformer.forward`.
+    """
+
+    def __init__(self, config: FLAConfig):
+        super().__init__()
+        self.n_embd = config.n_embd
+        self.expand = 4 * config.n_embd
+        self.num_experts = config.moe_num_experts
+        self.top_k = config.moe_top_k
+        if not 1 <= self.top_k <= self.num_experts:
+            raise ValueError(
+                f"moe_top_k must be in [1, moe_num_experts]; got top_k={self.top_k}, "
+                f"num_experts={self.num_experts}"
+            )
+        self.lbl_loss_weight = config.moe_lbl_loss_weight
+        # Router: matmul on the residual to produce per-expert logits. nanochat's
+        # Linear keeps the master weight in fp32 (good for the explicit float() cast
+        # of the logits below).
+        self.router = Linear(config.n_embd, self.num_experts, bias=False)
+        # Each expert is a (c_fc, c_proj) pair stored in parallel ModuleLists. Could
+        # be folded into a single (E, D, H) weight tensor with grouped GEMM for
+        # higher arithmetic intensity, but at small num_experts the per-expert loop
+        # is simpler and already does the ideal O(N·top_k) work.
+        self.experts_c_fc = nn.ModuleList(
+            [Linear(config.n_embd, self.expand, bias=False) for _ in range(self.num_experts)]
+        )
+        self.experts_c_proj = nn.ModuleList(
+            [Linear(self.expand, config.n_embd, bias=False) for _ in range(self.num_experts)]
+        )
+        # Communication slot for FLATransformer.forward to harvest the aux loss
+        # after each forward call. Reset at the start of every forward; left as
+        # None when not training or when lbl_loss_weight == 0.
+        self._last_aux_loss = None
+
+    def forward(self, x):
+        B, T, D = x.size()
+        N = B * T
+        x_flat = x.reshape(N, D)
+        # Router logits in fp32 — matches simply (`weight_dtype='float32'`) and
+        # keeps the softmax + topk numerically stable independent of activation dtype.
+        router_logits = self.router(x_flat).float()  # (N, E)
+
+        if self.top_k == 1:
+            # softmax → topk to keep gradient on the chosen logit non-zero.
+            router_probs = F.softmax(router_logits, dim=-1)
+            top_w, top_idx = torch.topk(router_probs, k=1, dim=-1)
+        else:
+            # topk → softmax: per-token weights normalized over the picked k.
+            top_logits, top_idx = torch.topk(router_logits, k=self.top_k, dim=-1)
+            top_w = F.softmax(top_logits, dim=-1)
+            router_probs = F.softmax(router_logits, dim=-1)
+        # Cast routing weights back to activation dtype for the residual add.
+        top_w = top_w.to(x.dtype)
+
+        out = torch.zeros_like(x_flat)
+        for e in range(self.num_experts):
+            # `mask`: which (token, k-slot) pairs picked expert e. Sum across k
+            # collapses to a per-token weight (a token would be 0 here unless it
+            # selected expert e in at least one of its k slots).
+            mask = (top_idx == e)
+            if not mask.any():
+                continue
+            weight_e = (top_w * mask).sum(dim=-1)  # (N,)
+            tok_idx = weight_e.nonzero(as_tuple=True)[0]
+            if tok_idx.numel() == 0:
+                continue
+            x_e = x_flat.index_select(0, tok_idx)
+            h = F.relu(self.experts_c_fc[e](x_e)).square()
+            y = self.experts_c_proj[e](h)
+            out.index_add_(0, tok_idx, y * weight_e[tok_idx, None])
+
+        # Auxiliary load-balancing loss. Only meaningful when training; skip in eval
+        # to save the full softmax + reductions when generate() is hot.
+        if self.training and self.lbl_loss_weight > 0.0:
+            # selection_freq[e]: fraction of (token, k-slot) routings landing on e.
+            # Detached so gradient flows only through the router_probs branch.
+            with torch.no_grad():
+                selection_onehot = F.one_hot(top_idx, self.num_experts).float()
+                selection_freq = selection_onehot.sum(dim=(0, 1)) / (N * self.top_k)
+            mean_prob = router_probs.mean(dim=0)  # (E,) — gradient flows through here
+            lbl_loss = self.num_experts * (selection_freq * mean_prob).sum()
+            self._last_aux_loss = lbl_loss * self.lbl_loss_weight
+        else:
+            self._last_aux_loss = None
+
+        return out.view(B, T, D)
+
+
+def _make_mlp(config: FLAConfig) -> nn.Module:
+    """Pick MLP vs MoE based on `moe_num_experts`. Token-routed top-k MoE replaces
+    the dense ReLU² FFN entirely (simply's pattern); the residual stream sees the
+    same `(B, T, n_embd)` output either way."""
+    if config.moe_num_experts > 0:
+        return _MoEMLP(config)
+    return _MLP(config)
+
+
 class _Block(nn.Module):
     """Pre-norm transformer block: residual = x + attn(norm(x), cos_sin); residual = x + mlp(norm(x))."""
 
     def __init__(self, config: FLAConfig, layer_idx: int):
         super().__init__()
         self.attn = _make_attn(config, layer_idx)
-        self.mlp = _MLP(config)
+        self.mlp = _make_mlp(config)
 
     def forward(self, x, cos_sin, past_key_values=None, use_cache=False):
         x = x + self.attn(_rms_norm(x), cos_sin, past_key_values=past_key_values, use_cache=use_cache)
@@ -481,8 +620,18 @@ class FLATransformer(nn.Module):
                 attn.reset_parameters(init_std=std)
             else:
                 raise AssertionError(f"unknown attn type {type(attn).__name__}")
-            nn.init.uniform_(block.mlp.c_fc.weight, -s * 0.4, s * 0.4)  # 0.4× scale on the up-proj (matches gpt.py)
-            nn.init.zeros_(block.mlp.c_proj.weight)
+            # MLP / MoE init. Dense MLP gets the same uniform up-proj + zero down-proj
+            # treatment as nanochat/gpt.py. MoE has the same per-expert pattern, plus a
+            # small uniform init on the router (zero would lock all tokens to expert 0
+            # at step 0; small uniform breaks symmetry).
+            if isinstance(block.mlp, _MoEMLP):
+                nn.init.uniform_(block.mlp.router.weight, -s * 0.1, s * 0.1)
+                for c_fc, c_proj in zip(block.mlp.experts_c_fc, block.mlp.experts_c_proj):
+                    nn.init.uniform_(c_fc.weight, -s * 0.4, s * 0.4)
+                    nn.init.zeros_(c_proj.weight)
+            else:
+                nn.init.uniform_(block.mlp.c_fc.weight, -s * 0.4, s * 0.4)  # 0.4× scale on the up-proj (matches gpt.py)
+                nn.init.zeros_(block.mlp.c_proj.weight)
 
         # Refresh the rotary buffers on the real device after to_empty().
         head_dim = cfg.n_embd // cfg.n_head
@@ -605,7 +754,24 @@ class FLATransformer(nn.Module):
             ignore_index=-1,
             reduction=loss_reduction,
         )
+        # Pull in any auxiliary losses stashed by MoE blocks during this forward.
+        # Each `_MoEMLP` writes its load-balancing loss to `_last_aux_loss` (None when
+        # not training or when lbl_loss_weight == 0). We sum across blocks and add to
+        # the main CE loss so a single backward pass handles both. Stashed back on
+        # the model (`self._last_aux_loss`) for logging.
+        aux = self._collect_moe_aux_loss()
+        self._last_aux_loss = aux  # python float on host or None — convenient to log
+        if aux is not None:
+            loss = loss + aux
         return loss
+
+    def _collect_moe_aux_loss(self):
+        total = None
+        for block in self.h:
+            mlp = block.mlp
+            if isinstance(mlp, _MoEMLP) and mlp._last_aux_loss is not None:
+                total = mlp._last_aux_loss if total is None else total + mlp._last_aux_loss
+        return total
 
     @torch.no_grad()
     def generate(
