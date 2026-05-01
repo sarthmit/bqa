@@ -40,7 +40,7 @@ COMMON=(
 )
 
 stage "DENSE GDN (target_flops=2.15e18)"
-torchrun --standalone --nproc_per_node=4 -m scripts.base_train \
+torchrun --standalone --nproc_per_node=4 -m scripts.base_train -- \
     "${COMMON[@]}" \
     --attn-kind=gdn \
     --device-batch-size=32 \
@@ -48,7 +48,7 @@ torchrun --standalone --nproc_per_node=4 -m scripts.base_train \
     --model-tag=d12_fla_gdn_dense
 
 stage "MoE GDN (8 experts, top_k=2, target_flops=2.15e18)"
-torchrun --standalone --nproc_per_node=4 -m scripts.base_train \
+torchrun --standalone --nproc_per_node=4 -m scripts.base_train -- \
     "${COMMON[@]}" \
     --attn-kind=gdn \
     --device-batch-size=16 \

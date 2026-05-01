@@ -45,7 +45,7 @@ COMMON=(
 )
 
 stage "DENSE MHA (target_flops=2.15e18)"
-torchrun --standalone --nproc_per_node=4 -m scripts.base_train \
+torchrun --standalone --nproc_per_node=4 -m scripts.base_train -- \
     "${COMMON[@]}" \
     --attn-kind=gqa \
     --device-batch-size=32 \
@@ -53,7 +53,7 @@ torchrun --standalone --nproc_per_node=4 -m scripts.base_train \
     --model-tag=d12_fla_mha_dense
 
 stage "MoE MHA (8 experts, top_k=2, target_flops=2.15e18)"
-torchrun --standalone --nproc_per_node=4 -m scripts.base_train \
+torchrun --standalone --nproc_per_node=4 -m scripts.base_train -- \
     "${COMMON[@]}" \
     --attn-kind=gqa \
     --device-batch-size=16 \

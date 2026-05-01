@@ -40,14 +40,14 @@ COMMON=(
 )
 
 stage "DENSE Hybrid alpha=0.25 (target_flops=2.15e18)"
-torchrun --standalone --nproc_per_node=4 -m scripts.base_train \
+torchrun --standalone --nproc_per_node=4 -m scripts.base_train -- \
     "${COMMON[@]}" \
     --device-batch-size=32 \
     --run=dummy \
     --model-tag=d12_fla_hybrid025_dense
 
 stage "MoE Hybrid alpha=0.25 (8 experts, top_k=2, target_flops=2.15e18)"
-torchrun --standalone --nproc_per_node=4 -m scripts.base_train \
+torchrun --standalone --nproc_per_node=4 -m scripts.base_train -- \
     "${COMMON[@]}" \
     --device-batch-size=16 \
     --moe-num-experts=8 \
