@@ -593,6 +593,11 @@ class FLATransformer(nn.Module):
         mha = set(self.mha_layer_indices())
         return [i for i in range(self.config.n_layer) if i not in mha]
 
+    def get_device(self):
+        """Return the device of the model (used by evaluate_bpb and the inference engine).
+        Pulled from wte since it's the canonical leaf parameter on every model."""
+        return self.wte.weight.device
+
     def __init__(self, config: FLAConfig, pad_vocab_size_to: int = 64):
         super().__init__()
         self.config = config
