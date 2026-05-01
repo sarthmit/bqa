@@ -67,13 +67,16 @@ parser.add_argument("--gdn-conv-size", type=int, default=4, help="GDN: short-con
 parser.add_argument("--gdn-no-gate", action="store_true", help="GDN: disable the output gating branch (g_proj + FusedRMSNormGated).")
 parser.add_argument("--gdn-allow-neg-eigval", action="store_true", help="GDN: multiply beta by 2 to allow negative eigenvalues (arXiv:2411.12537).")
 parser.add_argument("--alpha", type=float, default=0.5, help="Hybrid mode (--model-kind=fla --attn-kind=hybrid only): fraction of layers that are MHA, in [0, 1]. round(alpha * n_layer) MHA layers placed evenly across depth (Bresenham). 0.0 == all-GDN == --attn-kind=gdn; 1.0 == all-MHA == --attn-kind=gqa. Default 0.5 (alternating).")
-parser.add_argument("--gdn-lr", type=float, default=0.002, help="(GPT-path only) AdamW LR for the GDN-specific tensor group (A_log/dt_bias/conv1d/o_norm.weight) when --model-kind=gpt --attn-kind=gdn. Ignored for --model-kind=fla; use --fla-matrix-lr there.")
-parser.add_argument("--gdn-wd", type=float, default=0.1, help="(GPT-path only) AdamW weight_decay for the GDN linear-projection weights. Special tensors always use WD=0. Ignored for --model-kind=fla.")
-# --model-kind=fla optimizer LRs (single fused AdamW with three param groups; see
-# nanochat.model_fla.FLATransformer.setup_optimizer). embedding_lr/unembedding_lr
-# come from the existing nanochat AdamW knobs above.
-parser.add_argument("--fla-matrix-lr", type=float, default=0.002, help="(--model-kind=fla only) AdamW LR for everything except wte and lm_head — attention projections, MoE experts/router, GDN A_log/dt_bias/conv1d/o_norm, MLP gate/up/down. Default 0.002 is calibrated for AdamW on transformer matrices at d=12 hidden=768; this is NOT the same scale as --matrix-lr (which calibrates Muon).")
-parser.add_argument("--fla-matrix-wd", type=float, default=0.1, help="(--model-kind=fla only) AdamW weight_decay for the matrix group.")
+# Unified AdamW LR / WD for non-Muon param groups. Used by both:
+#   * --model-kind=gpt --attn-kind=gdn: the GDN-specific group (A_log / dt_bias /
+#     conv1d / o_norm.weight) inside MuonAdamW.
+#   * --model-kind=fla: every parameter except wte / lm_head (attention projs, MoE
+#     experts/router, GDN tensors, MLP gate/up/down).
+# Default 0.003 / 0.1 are AdamW-tuned for transformer matrices at d=12 hidden=768
+# — NOT comparable to the Muon-tuned --matrix-lr (which is intrinsically higher
+# because Newton-Schulz orthogonalizes the update).
+parser.add_argument("--fla-lr", type=float, default=0.003, help="AdamW LR for non-Muon param groups: GDN-specific group in the GPT path, or the matrix group in the fla path. AdamW-tuned default — much smaller than --matrix-lr (which is Muon-tuned).")
+parser.add_argument("--fla-wd", type=float, default=0.1, help="AdamW weight_decay for non-Muon param groups (same scope as --fla-lr).")
 # Mixture-of-Experts FFN (only meaningful with --model-kind=fla; replaces every block's
 # dense MLP with a token-routed top-k MoE; orthogonal to --attn-kind so combines freely
 # with mha / gdn / hybrid).
@@ -412,13 +415,13 @@ if args.model_kind == "fla":
     # Three AdamW groups matching nanochat's GPT recipe:
     #   * wte:     embedding_lr * dmodel_lr_scale * batch_lr_scale (high; default 0.3)
     #   * lm_head: unembedding_lr * dmodel_lr_scale * batch_lr_scale (default 0.008)
-    #   * matrix:  fla_matrix_lr * batch_lr_scale (AdamW-tuned; default 0.002)
+    #   * matrix:  fla_lr * batch_lr_scale (AdamW-tuned; default 0.003)
     # Without the per-group LRs the wte param starves at the matrix rate (~150×
     # too small) and early-step loss visibly trails the GPT path.
     fla_dmodel_scale = (model.config.n_embd / 768) ** -0.5
     optimizer = model.setup_optimizer(
-        lr=args.fla_matrix_lr * batch_lr_scale,
-        weight_decay=args.fla_matrix_wd,
+        lr=args.fla_lr * batch_lr_scale,
+        weight_decay=args.fla_wd,
         embedding_lr=args.embedding_lr * fla_dmodel_scale * batch_lr_scale,
         unembedding_lr=args.unembedding_lr * fla_dmodel_scale * batch_lr_scale,
     )
@@ -436,8 +439,8 @@ else:
         alpha_beta1=args.alpha_beta1,
         alpha_wd=args.alpha_wd,
         # GDN AdamW overrides
-        gdn_lr=args.gdn_lr * batch_lr_scale,
-        gdn_wd=args.gdn_wd,
+        gdn_lr=args.fla_lr * batch_lr_scale,
+        gdn_wd=args.fla_wd,
     )
 
 if resuming:
