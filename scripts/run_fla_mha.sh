@@ -16,6 +16,9 @@ REPO=/home/mila/m/mittalsa/scratch/bqa
 cd "$REPO"
 
 export PATH="$HOME/.local/bin:$PATH"
+# wandb logging — $WANDB_API_KEY is inherited from the submitting shell; project name
+# is read by base_train via env (overrides its default).
+export WANDB_PROJECT=FlexHybrid
 # setup_node.sh sets cache redirects (NANOCHAT_BASE_DIR / UV_CACHE_DIR / etc),
 # rsyncs .venv -> $SLURM_TMPDIR/nanochat-venv (ext4) under SLURM, and activates it.
 source scripts/setup_node.sh
@@ -49,7 +52,7 @@ torchrun --standalone --nproc_per_node=4 -m scripts.base_train -- \
     "${COMMON[@]}" \
     --attn-kind=gqa \
     --device-batch-size=32 \
-    --run=dummy \
+    --run=d12_mha_dense \
     --model-tag=d12_fla_mha_dense
 
 stage "MoE MHA (8 experts, top_k=2, target_flops=2.15e18)"
@@ -60,7 +63,7 @@ torchrun --standalone --nproc_per_node=4 -m scripts.base_train -- \
     --moe-num-experts=8 \
     --moe-top-k=2 \
     --moe-lbl-loss-weight=0.01 \
-    --run=dummy \
+    --run=d12_mha_moe \
     --model-tag=d12_fla_mha_moe
 
 stage "DONE"

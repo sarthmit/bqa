@@ -15,6 +15,7 @@ REPO=/home/mila/m/mittalsa/scratch/bqa
 cd "$REPO"
 
 export PATH="$HOME/.local/bin:$PATH"
+export WANDB_PROJECT=FlexHybrid
 source scripts/setup_node.sh
 
 stage() { echo "===== $(date '+%F %T') :: $* ====="; }
@@ -43,7 +44,7 @@ stage "DENSE Hybrid alpha=0.25 (target_flops=2.15e18)"
 torchrun --standalone --nproc_per_node=4 -m scripts.base_train -- \
     "${COMMON[@]}" \
     --device-batch-size=32 \
-    --run=dummy \
+    --run=d12_hybrid025_dense \
     --model-tag=d12_fla_hybrid025_dense
 
 stage "MoE Hybrid alpha=0.25 (8 experts, top_k=2, target_flops=2.15e18)"
@@ -53,7 +54,7 @@ torchrun --standalone --nproc_per_node=4 -m scripts.base_train -- \
     --moe-num-experts=8 \
     --moe-top-k=2 \
     --moe-lbl-loss-weight=0.01 \
-    --run=dummy \
+    --run=d12_hybrid025_moe \
     --model-tag=d12_fla_hybrid025_moe
 
 stage "DONE"

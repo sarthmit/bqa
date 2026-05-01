@@ -16,6 +16,7 @@ REPO=/home/mila/m/mittalsa/scratch/bqa
 cd "$REPO"
 
 export PATH="$HOME/.local/bin:$PATH"
+export WANDB_PROJECT=FlexHybrid
 source scripts/setup_node.sh
 
 stage() { echo "===== $(date '+%F %T') :: $* ====="; }
@@ -44,7 +45,7 @@ torchrun --standalone --nproc_per_node=4 -m scripts.base_train -- \
     "${COMMON[@]}" \
     --attn-kind=gdn \
     --device-batch-size=32 \
-    --run=dummy \
+    --run=d12_gdn_dense \
     --model-tag=d12_fla_gdn_dense
 
 stage "MoE GDN (8 experts, top_k=2, target_flops=2.15e18)"
@@ -55,7 +56,7 @@ torchrun --standalone --nproc_per_node=4 -m scripts.base_train -- \
     --moe-num-experts=8 \
     --moe-top-k=2 \
     --moe-lbl-loss-weight=0.01 \
-    --run=dummy \
+    --run=d12_gdn_moe \
     --model-tag=d12_fla_gdn_moe
 
 stage "DONE"
