@@ -12,10 +12,19 @@ dependencies = [
     "rustbpe>=0.1.0",
     "tiktoken>=0.11.0",
     "tokenizers>=0.22.0",
-    "torch==2.9.1",
+    "torch==2.8.0",
     "uvicorn>=0.36.0",
     "wandb>=0.21.3",
+    # Gated Delta Networks (attn_kind="gdn"). Pulls in einops + transformers.
+    "flash-linear-attention>=0.5.0",
 ]
+
+# flash-attn 2.8.3 (used by fla.layers.attn.Attention for the MHA path) is not on
+# PyPI as a regular wheel for Linux / cu12 / cp310; install from Dao-AILab's GH
+# releases. Pinned to torch 2.8.x cxx11abiTRUE which matches the torch dep above.
+# (Source build from `pip install flash-attn` works but takes 30-60+ min on this
+# CUDA 12.6 toolchain; the prebuilt wheel installs in 15 s.)
+#   uv pip install https://github.com/Dao-AILab/flash-attention/releases/download/v2.8.3/flash_attn-2.8.3+cu12torch2.8cxx11abiTRUE-cp310-cp310-linux_x86_64.whl
 
 [dependency-groups]
 dev = [
@@ -55,10 +64,10 @@ explicit = true
 [project.optional-dependencies]
 cpu = [
     "setuptools>=65.0.0",
-    "torch==2.9.1",
+    "torch==2.8.0",
 ]
 gpu = [
-    "torch==2.9.1",
+    "torch==2.8.0",
 ]
 
 [tool.uv]

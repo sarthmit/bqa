@@ -27,6 +27,7 @@ import torch.nn.functional as F
 import torch.distributed as dist
 
 from nanochat.gpt import GPT, GPTConfig, Linear
+from nanochat.model_fla import FLATransformer, FLAConfig
 from nanochat.dataloader import tokenizing_distributed_data_loader_bos_bestfit, tokenizing_distributed_data_loader_with_state_bos_bestfit
 from nanochat.common import compute_init, compute_cleanup, print0, DummyWandb, print_banner, get_base_dir, autodetect_device_type, get_peak_flops, COMPUTE_DTYPE, COMPUTE_DTYPE_REASON, is_ddp_initialized
 from nanochat.tokenizer import get_tokenizer, get_token_bytes
@@ -48,16 +49,26 @@ parser.add_argument("--device-type", type=str, default="", help="cuda|cpu|mps (e
 parser.add_argument("--fp8", action="store_true", help="enable FP8 training (requires H100+ GPU and torchao)")
 parser.add_argument("--fp8-recipe", type=str, default="tensorwise", choices=["rowwise", "tensorwise"], help="FP8 scaling recipe: tensorwise (faster, recommended) or rowwise (more accurate but slower)")
 # Model architecture
+parser.add_argument("--model-kind", type=str, default="gpt", choices=["gpt", "fla"], help="'gpt' (default) → nanochat.gpt.GPT (gqa/bqa/bqa_dyn/gdn variants); 'fla' → nanochat.model_fla.FLATransformer (clean transformer with fla-based mha or gdn, single-AdamW, no Muon).")
 parser.add_argument("--depth", type=int, default=20, help="depth of the Transformer model")
 parser.add_argument("--aspect-ratio", type=int, default=64, help="model_dim = depth * aspect_ratio")
 parser.add_argument("--head-dim", type=int, default=128, help="target head dimension for attention")
 parser.add_argument("--n-kv-head", type=int, default=-1, help="number of key/value heads for GQA / basis K/V heads for BQA. -1 (default) = n_head/2 (2:1 ratio). Pass n_head explicitly for MHA. Must divide n_head.")
-parser.add_argument("--attn-kind", type=str, default="gqa", choices=["gqa", "bqa", "bqa_dyn"], help="attention kind: 'gqa' (grouped-query, default), 'bqa' (basis-query, static per-layer mixing logits), or 'bqa_dyn' (per-query mixing logits = alpha_proj(x) + b_alpha, single softmax over a w-mixed score).")
-parser.add_argument("--bqa-init-mass-k", type=float, default=0.58, help="BQA / bqa_dyn: target softmax probability mass on the GQA-assigned basis for K (alpha_k) at init (in (0,1)). bqa_dyn uses this for its single b_alpha. Default 0.58 reproduces the d12 logit≈1.0 sweet spot.")
-parser.add_argument("--bqa-init-mass-v", type=float, default=0.58, help="BQA: target softmax probability mass on the GQA-assigned basis for V (alpha_v) at init (in (0,1)). Trained-entropy data shows V converges much more concentrated than K, so m_v can usefully be initialized higher than m_k. Ignored for bqa_dyn.")
-parser.add_argument("--alpha-lr-mult", type=float, default=1.0, help="BQA: multiplier on the alpha_{k,v} (and bqa_dyn b_alpha) AdamW LR, on top of the embedding_lr * dmodel scale. 1.0 is the existing baseline.")
+parser.add_argument("--attn-kind", type=str, default="gqa", choices=["gqa", "bqa", "bqa_dyn", "gdn", "hybrid"], help="attention kind: 'gqa' (grouped-query, default), 'bqa' (basis-query, static per-layer mixing logits), 'bqa_dyn' (per-query independent K/V mixing logits = alpha_proj_{k,v}(x) + b_alpha_{k,v}, single softmax over a w-mixed score), 'gdn' (Gated Delta Networks linear-recurrent attention from fla, chunked parallel kernel; requires n_kv_head == n_head), or 'hybrid' (only valid with --model-kind=fla; per-layer mix of MHA and GDN with MHA fraction set by --alpha).")
+parser.add_argument("--bqa-init-mass-k", type=float, default=0.58, help="BQA / bqa_dyn: target softmax probability mass on the GQA-assigned basis for K (alpha_k / b_alpha_k) at init (in (0,1)). Default 0.58 reproduces the d12 logit≈1.0 sweet spot.")
+parser.add_argument("--bqa-init-mass-v", type=float, default=0.58, help="BQA / bqa_dyn: target softmax probability mass on the GQA-assigned basis for V (alpha_v / b_alpha_v) at init (in (0,1)). Trained-entropy data shows V converges much more concentrated than K, so m_v can usefully be initialized higher than m_k.")
+parser.add_argument("--alpha-lr-mult", type=float, default=1.0, help="BQA: multiplier on the alpha_{k,v} (static) / b_alpha_{k,v} (bqa_dyn) AdamW LR, on top of the embedding_lr * dmodel scale. 1.0 is the existing baseline.")
 parser.add_argument("--alpha-beta1", type=float, default=0.9, help="BQA: AdamW beta1 for the alpha_{k,v} group. Default 0.9 matches the existing baseline; lower (e.g. 0.5) gives faster response on these tiny logit tensors.")
 parser.add_argument("--alpha-wd", type=float, default=0.0, help="BQA: AdamW weight_decay for the alpha_{k,v} group. Default 0.0 to avoid pulling the softmax toward uniform; small positive values may regularize.")
+# GDN-only knobs (mirror fla.layers.GatedDeltaNet defaults; ignored for non-gdn).
+parser.add_argument("--gdn-expand-v", type=float, default=2.0, help="GDN: head_v_dim = head_dim * expand_v. fla default = 2.0.")
+parser.add_argument("--gdn-no-short-conv", action="store_true", help="GDN: disable the silu(Conv1d(K=4)) before Q/K/V. fla warns this hurts performance.")
+parser.add_argument("--gdn-conv-size", type=int, default=4, help="GDN: short-conv kernel size. fla default = 4.")
+parser.add_argument("--gdn-no-gate", action="store_true", help="GDN: disable the output gating branch (g_proj + FusedRMSNormGated).")
+parser.add_argument("--gdn-allow-neg-eigval", action="store_true", help="GDN: multiply beta by 2 to allow negative eigenvalues (arXiv:2411.12537).")
+parser.add_argument("--alpha", type=float, default=0.5, help="Hybrid mode (--model-kind=fla --attn-kind=hybrid only): fraction of layers that are MHA, in [0, 1]. round(alpha * n_layer) MHA layers placed evenly across depth (Bresenham). 0.0 == all-GDN == --attn-kind=gdn; 1.0 == all-MHA == --attn-kind=gqa. Default 0.5 (alternating).")
+parser.add_argument("--gdn-lr", type=float, default=0.002, help="GDN: AdamW LR for the GDN module's parameters (linear projections + special tensors). The global warmup/warmdown schedule still applies on top.")
+parser.add_argument("--gdn-wd", type=float, default=0.1, help="GDN: AdamW weight_decay for the GDN linear-projection weights. Special tensors (A_log/dt_bias/o_norm/conv1d) always use WD=0.")
 parser.add_argument("--seed", type=int, default=42, help="global torch seed for model init / dataloader shuffling. Same value used across all DDP ranks; non-determinism remains from cuDNN / flash-attn / fp8 kernels.")
 parser.add_argument("--max-seq-len", type=int, default=2048, help="max context length")
 parser.add_argument("--window-pattern", type=str, default="SSSL", help="sliding window pattern tiled across layers: L=full, S=half context (e.g. 'SSL')")
@@ -140,22 +151,63 @@ def build_model_meta(depth, n_kv_head_override=None, attn_kind_override=None):
 
     The override args let callers (e.g. the d12 reference used for scaling-law math)
     bypass user CLI choices that may not divide cleanly at a different depth.
+
+    Two model kinds:
+      * `gpt`: nanochat.gpt.GPT (default; gqa/bqa/bqa_dyn/gdn variants, value-residual,
+               smear/x0/backout, Muon for matrices).
+      * `fla`: nanochat.model_fla.FLATransformer (clean transformer; attn_kind ∈
+               {mha, gdn} with implementations from fla; single AdamW for everything).
     """
     # Model dim is nudged up to nearest multiple of head_dim for clean division
     # (FA3 requires head_dim divisible by 8, and this guarantees head_dim == args.head_dim exactly)
     base_dim = depth * args.aspect_ratio
     model_dim = ((base_dim + args.head_dim - 1) // args.head_dim) * args.head_dim
     num_heads = model_dim // args.head_dim
+    attn_kind = args.attn_kind if attn_kind_override is None else attn_kind_override
+    if args.model_kind == "fla":
+        # FLATransformer is fixed at n_kv_head == n_head per branch constraint, so it
+        # ignores --n-kv-head. CLI attn_kind maps: gqa→mha, gdn→gdn, hybrid→hybrid;
+        # bqa/bqa_dyn aren't supported here.
+        fla_attn_kind = "mha" if attn_kind in ("gqa", "mha") else attn_kind
+        if fla_attn_kind not in ("mha", "gdn", "hybrid"):
+            raise ValueError(
+                f"--model-kind=fla only supports --attn-kind=gqa (→mha), gdn, or hybrid; got {attn_kind!r}."
+            )
+        if fla_attn_kind == "hybrid" and not 0.0 <= args.alpha <= 1.0:
+            raise ValueError(f"--alpha must be in [0, 1], got {args.alpha}")
+        fla_cfg = FLAConfig(
+            sequence_len=args.max_seq_len, vocab_size=vocab_size,
+            n_layer=depth, n_head=num_heads, n_embd=model_dim,
+            attn_kind=fla_attn_kind,
+            alpha=args.alpha,
+            gdn_expand_v=args.gdn_expand_v,
+            gdn_use_short_conv=not args.gdn_no_short_conv,
+            gdn_conv_size=args.gdn_conv_size,
+            gdn_use_gate=not args.gdn_no_gate,
+            gdn_allow_neg_eigval=args.gdn_allow_neg_eigval,
+        )
+        with torch.device("meta"):
+            model_meta = FLATransformer(fla_cfg)
+        if fla_attn_kind == "hybrid":
+            mha_idxs = model_meta.mha_layer_indices()
+            gdn_idxs = model_meta.gdn_layer_indices()
+            layout = "".join("M" if i in set(mha_idxs) else "G" for i in range(depth))
+            print0(f"[fla:hybrid] alpha={args.alpha:.3f} → {len(mha_idxs)}/{depth} MHA, {len(gdn_idxs)}/{depth} GDN; layout {layout}")
+        return model_meta
     n_kv_head_arg = args.n_kv_head if n_kv_head_override is None else n_kv_head_override
     n_kv_head = max(1, num_heads // 2) if n_kv_head_arg <= 0 else n_kv_head_arg
     assert num_heads % n_kv_head == 0, f"n_head ({num_heads}) must be divisible by n_kv_head ({n_kv_head}). For odd n_head, override with --n-kv-head."
-    attn_kind = args.attn_kind if attn_kind_override is None else attn_kind_override
     config = GPTConfig(
         sequence_len=args.max_seq_len, vocab_size=vocab_size,
         n_layer=depth, n_head=num_heads, n_kv_head=n_kv_head, n_embd=model_dim,
         window_pattern=args.window_pattern, attn_kind=attn_kind,
         bqa_init_mass_k=args.bqa_init_mass_k,
         bqa_init_mass_v=args.bqa_init_mass_v,
+        gdn_expand_v=args.gdn_expand_v,
+        gdn_use_short_conv=not args.gdn_no_short_conv,
+        gdn_conv_size=args.gdn_conv_size,
+        gdn_use_gate=not args.gdn_no_gate,
+        gdn_allow_neg_eigval=args.gdn_allow_neg_eigval,
     )
     with torch.device("meta"):
         model_meta = GPT(config)
@@ -183,8 +235,13 @@ if resuming:
 # -----------------------------------------------------------------------------
 # FP8 training initialization and management (this has to be done before torch.compile)
 
-# Convert Linear layers to Float8Linear if --fp8 is set
-if args.fp8:
+# Convert Linear layers to Float8Linear if --fp8 is set.
+# FP8 is GPT-only — FLATransformer's fla layers (Attention/GatedDeltaNet) ship custom
+# kernels that consume bf16 directly and would not be wrapped by convert_to_float8_training
+# in a meaningful way. Silently disable for --model-kind=fla.
+if args.fp8 and args.model_kind == "fla":
+    print0("Warning: --fp8 ignored for --model-kind=fla (fla layers use their own kernels).")
+elif args.fp8:
     if device_type != "cuda":
         print0("Warning: FP8 training requires CUDA, ignoring --fp8 flag")
     else:
@@ -262,7 +319,11 @@ def disable_fp8(model):
 # Compile the model
 
 orig_model = model # original, uncompiled model, for saving raw model state_dict and for inference/evaluation (because the shapes may change shape)
-model = torch.compile(model, dynamic=False) # the inputs to model will never change shape so dynamic=False is safe
+# Skip torch.compile for the fla path: fla.GatedDeltaNet and fla.Attention already wrap
+# their hot kernels with @triton/@torch.compile internally, and double-compiling has been
+# observed to thrash the dynamo cache. The bare model is fast enough on A100.
+if args.model_kind != "fla":
+    model = torch.compile(model, dynamic=False) # the inputs to model will never change shape so dynamic=False is safe
 
 # -----------------------------------------------------------------------------
 # Scaling laws and muP extrapolations to determine the optimal training horizon, batch size, learning rates, weight decay.
@@ -323,20 +384,34 @@ if weight_decay_scaled != args.weight_decay:
     print0(f"Scaling weight decay from {args.weight_decay:.6f} to {weight_decay_scaled:.6f} for depth {args.depth}")
 
 # -----------------------------------------------------------------------------
-# Initialize the Optimizer (combined MuonAdamW: Muon for matrix params, AdamW for rest)
-optimizer = model.setup_optimizer(
-    # AdamW hyperparameters
-    unembedding_lr=args.unembedding_lr * batch_lr_scale,
-    embedding_lr=args.embedding_lr * batch_lr_scale,
-    scalar_lr=args.scalar_lr * batch_lr_scale,
-    # Muon hyperparameters
-    matrix_lr=args.matrix_lr * batch_lr_scale,
-    weight_decay=weight_decay_scaled,
-    # BQA alpha-group AdamW overrides
-    alpha_lr_mult=args.alpha_lr_mult,
-    alpha_beta1=args.alpha_beta1,
-    alpha_wd=args.alpha_wd,
-)
+# Initialize the Optimizer.
+# - --model-kind=gpt → MuonAdamW: Muon for 2D matrices, AdamW for embeddings + scalars
+#                     + BQA alpha logits + GDN special tensors. The setup_optimizer call
+#                     takes many group-specific overrides.
+# - --model-kind=fla → single AdamW group covering every parameter, one shared LR + WD.
+#                     Reuses the same warmup/warmdown scheduler below.
+if args.model_kind == "fla":
+    optimizer = model.setup_optimizer(
+        lr=args.gdn_lr * batch_lr_scale,  # reuse --gdn-lr as the single AdamW LR (default 0.002)
+        weight_decay=args.gdn_wd,
+    )
+else:
+    optimizer = model.setup_optimizer(
+        # AdamW hyperparameters
+        unembedding_lr=args.unembedding_lr * batch_lr_scale,
+        embedding_lr=args.embedding_lr * batch_lr_scale,
+        scalar_lr=args.scalar_lr * batch_lr_scale,
+        # Muon hyperparameters
+        matrix_lr=args.matrix_lr * batch_lr_scale,
+        weight_decay=weight_decay_scaled,
+        # BQA alpha-group AdamW overrides
+        alpha_lr_mult=args.alpha_lr_mult,
+        alpha_beta1=args.alpha_beta1,
+        alpha_wd=args.alpha_wd,
+        # GDN AdamW overrides
+        gdn_lr=args.gdn_lr * batch_lr_scale,
+        gdn_wd=args.gdn_wd,
+    )
 
 if resuming:
     optimizer.load_state_dict(optimizer_data)
@@ -545,7 +620,8 @@ while True:
     muon_weight_decay = get_weight_decay(step)
     for group in optimizer.param_groups:
         group["lr"] = group["initial_lr"] * lrm
-        if group['kind'] == 'muon':
+        # FLATransformer uses plain torch.optim.AdamW which has no 'kind' key — guard.
+        if group.get('kind') == 'muon':
             group["momentum"] = muon_momentum
             group["weight_decay"] = muon_weight_decay
     if scaler is not None:

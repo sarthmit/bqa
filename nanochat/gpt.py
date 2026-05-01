@@ -39,13 +39,31 @@ class GPTConfig:
     #   "bqa"      — Basis Query Attention: each query head attends to a learned softmax mixture
     #                of all n_kv_head basis K/V heads (alpha logits, shape (n_head, n_kv_head)).
     #                At init, alpha is set so BQA recovers GQA exactly; training can then deviate.
-    #   "bqa_dyn"  — Per-query logit-mix BQA: mixing logits are produced per token by a small
-    #                Linear `alpha_proj(x)` plus a learned static bias `b_alpha`. Each query
-    #                position picks its own basis combination, applied to *every* past key.
+    #   "bqa_dyn"  — Per-query logit-mix BQA: independent K and V mixing logits are produced
+    #                per token by Linear `alpha_proj_{k,v}(x)` plus learned static biases
+    #                `b_alpha_{k,v}` (mirrors BQA static's alpha_k / alpha_v). Each query
+    #                position picks its own (separate) K and V basis combinations, applied
+    #                to every past key / past value.
     #                Implemented by materializing per-pair basis scores S[b,h,t,s,j] and
     #                summing across j with w[b,t,h,j] BEFORE softmax — single softmax per
     #                (t,h), unlike Mixture-of-Softmaxes. See DynamicBasisQueryAttention.
+    #   "gdn"      — Gated Delta Networks (linear-recurrent attention with input-dependent
+    #                forget gate and Householder-style update). Adapted from fla
+    #                (https://github.com/fla-org/flash-linear-attention,
+    #                arXiv:2412.06464). Trained with the chunked parallel kernel
+    #                (`chunk_gated_delta_rule`); requires n_kv_head == n_head (no GVA on this
+    #                branch — additional V-head sharing can be revisited later). No rotary,
+    #                no sliding window, no value-residual: GDN's recurrence handles ordering
+    #                and locality, and its short conv before Q/K/V already plays the role of
+    #                local mixing. See GatedDeltaNetAttention.
     attn_kind: str = "gqa"
+    # GDN-only knobs (mirror fla's GatedDeltaNet defaults; ignored for non-gdn).
+    gdn_expand_v: float = 2.0          # head_v_dim = head_dim * expand_v
+    gdn_use_short_conv: bool = True    # silu(Conv1d(K=4)) before Q/K/V (crucial per fla)
+    gdn_conv_size: int = 4
+    gdn_use_gate: bool = True          # output gating via FusedRMSNormGated(g_proj(x))
+    gdn_allow_neg_eigval: bool = False # if True, beta is multiplied by 2 (arXiv:2411.12537)
+    gdn_mode: str = "chunk"            # 'chunk' for training; 'fused_recurrent' is auto-used at q_len <= 64 in eval
     # BQA / bqa_dyn: target softmax probability mass placed on the GQA-assigned
     # basis at init, separately for K and V. The remaining (1 - m) is split
     # uniformly over the other (n_kv_head - 1) basis heads; the actual init
@@ -55,8 +73,8 @@ class GPTConfig:
     # much more concentrated than K (≈0.07 vs ≈0.40 ratio at d16), so m_v can
     # usefully be initialized higher than m_k. Default 0.58 (symmetric)
     # reproduces the d12 tuned value (logit≈1.0 at J=3). Set to 1/n_kv_head
-    # for uniform init; n_kv_head=1 falls through to a no-op. bqa_dyn has a
-    # single basis-mixing logit, so it uses m_k (m_v is ignored there).
+    # for uniform init; n_kv_head=1 falls through to a no-op. bqa_dyn uses both
+    # m_k and m_v (one per independent K/V mixing-logit head), same as static BQA.
     bqa_init_mass_k: float = 0.58
     bqa_init_mass_v: float = 0.58
     # Sliding window attention pattern string, tiled across layers. Final layer always L.
@@ -70,7 +88,10 @@ class GPTConfig:
         For GQA the cache is sized to the (smaller) basis count; for BQA the cache holds
         the post-mix K/V, which has full n_head heads.
         For bqa_dyn the cache would need to store basis K/V (mix is per-query at inference
-        time), but inference cache is not yet implemented for bqa_dyn — training-only."""
+        time), but inference cache is not yet implemented for bqa_dyn — training-only.
+        For gdn the cache structure is different (recurrent_state + conv_state, see fla);
+        nanochat's tensor-shaped cache doesn't apply, and inference cache is not yet wired
+        — gdn is training-only on this branch."""
         if self.attn_kind == "bqa":
             return self.n_head
         return self.n_kv_head
@@ -297,19 +318,32 @@ class BasisQueryAttention(nn.Module):
 
 class DynamicBasisQueryAttention(nn.Module):
     """
-    Per-query logit-mix BQA. Each query position t produces its own mixing distribution
-    w[t, h, :] over the n_kv_head basis K/V heads via softmax(alpha_proj(x_t) + b_alpha).
-    Effective per-query K/V are then  K_eff[t,s,h] = Σ_j w[t,h,j] · K_basis[s,j], so the
-    mix depends on BOTH the query position (via w) and the key position (via K_basis).
-    A SINGLE softmax over s is applied to the w-mixed scores — this is *not* mixture-of-
-    softmaxes (which would softmax J times then mix outputs). See the BQA paper-style
-    derivation in scripts/bqa_bench.py / training notes.
+    Per-query logit-mix BQA with INDEPENDENT K and V mixings (mirrors BQA static's
+    alpha_k / alpha_v structure). Each query position t produces its own K and V
+    mixing distributions w_k[t, h, :], w_v[t, h, :] over the n_kv_head basis K/V
+    heads via softmax(alpha_proj_{k,v}(x_t) + b_alpha_{k,v}). Effective per-query
+    K_eff[t,s,h] = Σ_j w_k[t,h,j] · K_basis[s,j]; effective per-query V is given
+    by O[t,h,d] = Σ_j w_v[t,h,j] · (Σ_s p[t,s,h] · V_basis[s,j,d]). A SINGLE
+    softmax over s is applied to the w_k-mixed scores (not mixture-of-softmaxes).
 
-    Implementation: materialize basis scores S[b,h,t,s,j] = ⟨Q[b,t,h], K_basis[b,s,j]⟩,
-    collapse with w to per-pair scores, softmax, then aggregate V by the linearity-factored
-    form O[t,h] = Σ_j w[t,h,j] · (Σ_s p[t,s,h] · V_basis[s,j]). Memory of S is
-    (B, H, T, T, J) — sized so this fits on one A100 80GB at d=12, J=3 with B≤8 (no
-    activation checkpointing needed). For larger configs reduce --device-batch-size.
+    ve gate is per-query-head (n_head outputs, matching BQA static): gate(x_s)[h]
+    modulates the VE contribution from source position s through the same w_v
+    path. Implemented by baking the gate into the attention weights for the VE
+    branch (p_gated[t,s,h] = p[t,s,h] · gate[s,h]) and adding the resulting VE
+    aggregate to the V aggregate before the per-query w_v mix.
+
+    Implementation: Q-side fold (algebraically identical to materializing
+    S[b,h,t,s,j] but uses standard attention infra). Define
+        Q_w[b,t,h,j,d] = w_k[b,t,h,j] · Q[b,t,h,d],
+    then
+        score[t,s,h] = Σⱼ wₖ[t,h,j]·⟨Q[t,h], K_basis[s,j]⟩
+                     = Σ_(j,d) Q_w[t,h,(j,d)] · K_basis_flat[s,(j,d)]
+                     = ⟨Q_w_flat[t,h,:], K_basis_flat[s,:]⟩  with head_dim_eff = J·D.
+    That's a standard MHA score with widened head dim — single softmax over s, no
+    (B,H,T,T,J) tensor anywhere. Per-head V is `V_basis + gate(x_s)·ve` (per source,
+    per head, matching BQA static's ve gate). Per-query w_v mix is applied OUTSIDE
+    the kernel as a small einsum: y[t,h,d] = Σⱼ wᵥ[t,h,j]·o[t,h,j,d].
+    Memory drops from O(B·H·T²·J) to O(B·T·H·J·D); DBS can be similar to MHA.
     """
     def __init__(self, config, layer_idx):
         super().__init__()
@@ -324,14 +358,19 @@ class DynamicBasisQueryAttention(nn.Module):
         self.c_k = Linear(self.n_embd, self.n_kv_head * self.head_dim, bias=False)
         self.c_v = Linear(self.n_embd, self.n_kv_head * self.head_dim, bias=False)
         self.c_proj = Linear(self.n_embd, self.n_embd, bias=False)
-        # Input-dependent mixing-logit projection. Init to zero so step-0 logits = b_alpha.
-        self.alpha_proj = Linear(self.n_embd, self.n_head * self.n_kv_head, bias=False)
-        # Static bias on mixing logits — initialized in GPT.init_weights to recover GQA.
-        self.b_alpha = nn.Parameter(torch.zeros(self.n_head, self.n_kv_head))
-        # ve gating shaped per basis head (same as GQA) — ve fuses into V_basis pre-mix
-        # since the ve contribution is per-key-position and basis-indexed.
+        # Independent K and V mixing-logit projections (mirrors BQA static's
+        # alpha_k / alpha_v). alpha_proj_{k,v}.weight init to zero so step-0
+        # logits = b_alpha_{k,v} (GQA-leaning init in GPT.init_weights).
+        self.alpha_proj_k = Linear(self.n_embd, self.n_head * self.n_kv_head, bias=False)
+        self.alpha_proj_v = Linear(self.n_embd, self.n_head * self.n_kv_head, bias=False)
+        # Static biases on K and V mixing logits — initialized to recover GQA.
+        self.b_alpha_k = nn.Parameter(torch.zeros(self.n_head, self.n_kv_head))
+        self.b_alpha_v = nn.Parameter(torch.zeros(self.n_head, self.n_kv_head))
+        # ve gate: per-query-head (matches BQA static; n_head outputs). Each source
+        # position s produces gate(x_s)[h] that modulates the VE attention contribution
+        # before the w_v mix.
         self.ve_gate_channels = 12
-        self.ve_gate = Linear(self.ve_gate_channels, self.n_kv_head, bias=False) if has_ve(layer_idx, config.n_layer) else None
+        self.ve_gate = Linear(self.ve_gate_channels, self.n_head, bias=False) if has_ve(layer_idx, config.n_layer) else None
 
     def forward(self, x, ve, cos_sin, window_size, kv_cache):
         if kv_cache is not None:
@@ -339,56 +378,187 @@ class DynamicBasisQueryAttention(nn.Module):
         B, T, C = x.size()
         H, J, D = self.n_head, self.n_kv_head, self.head_dim
 
-        # Per-query mixing weights. softmax in fp32 for stability, cast to compute dtype.
-        alpha_logits = self.alpha_proj(x).view(B, T, H, J) + self.b_alpha
-        w = F.softmax(alpha_logits.float(), dim=-1).to(x.dtype)  # (B, T, H, J)
+        # Per-query mixing weights: independent K and V (matches BQA static's
+        # alpha_k / alpha_v). softmax in fp32 for stability, cast to compute dtype.
+        alpha_logits_k = self.alpha_proj_k(x).view(B, T, H, J) + self.b_alpha_k
+        alpha_logits_v = self.alpha_proj_v(x).view(B, T, H, J) + self.b_alpha_v
+        w_k = F.softmax(alpha_logits_k.float(), dim=-1).to(x.dtype)  # (B, T, H, J)
+        w_v = F.softmax(alpha_logits_v.float(), dim=-1).to(x.dtype)  # (B, T, H, J)
 
         # Standard projections.
         q = self.c_q(x).view(B, T, H, D)
         k_basis = self.c_k(x).view(B, T, J, D)
         v_basis = self.c_v(x).view(B, T, J, D)
 
-        # ve residual is per-key-position and basis-indexed → folds into V_basis directly,
-        # before the dynamic mix (this is identical to static-BQA's handling).
-        if ve is not None:
-            ve = ve.view(B, T, J, D)
-            gate = 3 * torch.sigmoid(self.ve_gate(x[..., :self.ve_gate_channels]))  # (B, T, J)
-            v_basis = v_basis + gate.unsqueeze(-1) * ve
-
         # Rotary on q (per query position) and k_basis (per key position). QK norm + ×1.2.
+        # Note: rotary acts on the last dim (D), so it MUST run before the J-fold below.
         cos, sin = cos_sin
         q = apply_rotary_emb(q, cos, sin)
         k_basis = apply_rotary_emb(k_basis, cos, sin)
         q = norm(q) * 1.2
         k_basis = norm(k_basis) * 1.2
 
-        scale = 1.0 / (self.head_dim ** 0.5)
-        # (1) Per-pair basis scores. Memory: (B, H, T, T, J).
-        # S[b, h, t, s, j] = ⟨Q[b, t, h], K_basis[b, s, j]⟩
-        S = torch.einsum('bthd,bsjd->bhtsj', q, k_basis) * scale
-        # (2) Mix with per-query w to get a single score per (t, s, h).
-        score = torch.einsum('bhtsj,bthj->bhts', S, w)
+        # Q-side fold: bake w_k into Q so the basis-mix becomes part of a standard
+        # attention score (single softmax over s, no (B,H,T,T,J) tensor).
+        # Q_eff[b, t, h, j, d] = w_k[b, t, h, j] · Q[b, t, h, d], then flatten (j,d).
+        # Pre-scale by sqrt(J) so SDPA's default 1/sqrt(J·D) becomes 1/sqrt(D),
+        # matching the per-basis-D scale of the explicit formulation.
+        q_eff = (w_k.unsqueeze(-1) * q.unsqueeze(-2)).reshape(B, T, H, J * D) * (J ** 0.5)
 
-        # (3) Causal + sliding-window mask, then softmax over key positions.
-        device = score.device
-        row = torch.arange(T, device=device).view(-1, 1)
-        col = torch.arange(T, device=device).view(1, -1)
-        mask = col <= row
-        win = window_size[0]
-        if win >= 0 and win < T:
-            mask = mask & ((row - col) <= win)
-        score = score.masked_fill(~mask, float('-inf'))
-        p = F.softmax(score, dim=-1)  # (B, H, T, T)
+        # K_eff: same K_basis for every query head (no per-head mix on K side — the
+        # mix lives in Q). Replicate K_basis across H so flash_attn shim sees a
+        # standard num_q_heads == num_kv_heads layout. (Could use enable_gqa with
+        # num_kv_heads=1, but per-head V below requires num_kv_heads=H anyway —
+        # see ve handling — so we keep K and V symmetric for one SDPA call.)
+        k_eff = k_basis.unsqueeze(2).expand(B, T, H, J, D).reshape(B, T, H, J * D)
 
-        # (4) V aggregation, factored: J p-weighted sums of V_basis, then per-query mix.
-        # O'[b, t, h, j, d] = Σ_s p[b, h, t, s] · V_basis[b, s, j, d]
-        O_prime = torch.einsum('bhts,bsjd->bthjd', p, v_basis)
-        # O[b, t, h, d] = Σ_j w[b, t, h, j] · O'[b, t, h, j, d]
-        y = torch.einsum('bthj,bthjd->bthd', w, O_prime)
+        # V_eff: per-head V combines V_basis with optional ve residual. ve gate is
+        # per-source-per-head (matches BQA static), applied at the source position
+        # by adding gate(x_s)[h] · ve[s, j, d] to V_basis[s, j, d].
+        if ve is not None:
+            ve = ve.view(B, T, J, D)
+            gate = 3 * torch.sigmoid(self.ve_gate(x[..., :self.ve_gate_channels]))  # (B, T, H)
+            # broadcast: V_basis (B,T,1,J,D) + gate (B,T,H,1,1) * ve (B,T,1,J,D)
+            v_combined = v_basis.unsqueeze(2) + gate[..., None, None] * ve.unsqueeze(2)
+            v_eff = v_combined.reshape(B, T, H, J * D)
+        else:
+            v_eff = v_basis.unsqueeze(2).expand(B, T, H, J, D).reshape(B, T, H, J * D)
+
+        # Standard attention with widened head_dim = J·D. The SDPA fallback in
+        # nanochat.flash_attention handles head_dim > 128 via mem_efficient/math
+        # backends. Causal + sliding window come for free.
+        o = flash_attn.flash_attn_func(q_eff, k_eff, v_eff, causal=True, window_size=window_size)
+        o = o.reshape(B, T, H, J, D)
+
+        # Per-query w_v mix to per-query-head output (the only "outside the kernel"
+        # piece — wᵥ is t-indexed, can't be folded into V at source).
+        y = torch.einsum('bthj,bthjd->bthd', w_v, o)
 
         y = y.contiguous().view(B, T, -1)
         y = self.c_proj(y)
         return y
+
+
+class GatedDeltaNetAttention(nn.Module):
+    """
+    Gated Delta Networks (GDN) layer adapted from fla:
+        https://github.com/fla-org/flash-linear-attention/blob/main/fla/layers/gated_deltanet.py
+        Reference: Yang, Kautz, Hatamizadeh — arXiv:2412.06464.
+
+    GDN is a linear-recurrent attention layer with input-dependent forget gate (alpha) and
+    a Householder-style delta-rule update on a recurrent state matrix; trained with fla's
+    chunked parallel kernel (`chunk_gated_delta_rule`) and run at inference time with the
+    fused recurrent kernel. A causal short conv (silu(Conv1d(K=4))) is applied to Q/K/V
+    before the recurrence (per fla, this is "crucial to the performance" — disabling it is
+    not recommended).
+
+    nanochat-specific notes:
+    - Forward signature matches the other attention modules. ve, cos_sin and window_size
+      are ignored: GDN's recurrence handles ordering and locality, the short conv plays
+      the role of local mixing, and the value-residual branch isn't part of the published
+      GDN recipe. (We could fold `ve` into V before the conv on a follow-up branch if
+      experiments motivate it.)
+    - kv_cache is not supported here yet. fla uses a structurally different cache
+      (`recurrent_state` + per-stream `conv_state`) that does not fit nanochat's
+      tensor-shaped per-layer (k, v) cache. Training-only on this branch.
+    - `n_kv_head == n_head` is required on this branch (no GVA / per-feature V sharing —
+      revisit later if useful).
+    - Parameter init runs in `reset_parameters()`, called from `GPT.init_weights()` after
+      `to_empty()`, since fla's __init__ does its data-init in __init__ which is wiped
+      by nanochat's meta-device → to_empty path.
+    """
+    def __init__(self, config, layer_idx):
+        super().__init__()
+        # Lazy-import so non-gdn runs don't pay the fla import cost (and so the dependency
+        # is only required when the user actually opts into gdn).
+        from fla.layers.gated_deltanet import GatedDeltaNet
+        assert config.n_kv_head == config.n_head, (
+            f"gdn requires n_kv_head == n_head on this branch (got n_head={config.n_head}, "
+            f"n_kv_head={config.n_kv_head}). Per-feature V-head sharing (GVA) is intentionally "
+            "not used here; pass --n-kv-head equal to n_head."
+        )
+        self.layer_idx = layer_idx
+        self.n_embd = config.n_embd
+        self.n_head = config.n_head
+        self.head_dim = config.n_embd // config.n_head
+        self.use_gate = config.gdn_use_gate
+        self.use_short_conv = config.gdn_use_short_conv
+        self.inner = GatedDeltaNet(
+            hidden_size=config.n_embd,
+            expand_v=config.gdn_expand_v,
+            head_dim=self.head_dim,
+            num_heads=config.n_head,
+            num_v_heads=config.n_head,
+            mode=config.gdn_mode,
+            use_gate=config.gdn_use_gate,
+            use_short_conv=config.gdn_use_short_conv,
+            conv_size=config.gdn_conv_size,
+            allow_neg_eigval=config.gdn_allow_neg_eigval,
+            layer_idx=layer_idx,
+        )
+        # Match the rest of the nanochat attention API: a `ve_gate` attribute that
+        # init_weights and any future inspection can probe with hasattr or `is not None`.
+        self.ve_gate = None
+
+    def forward(self, x, ve, cos_sin, window_size, kv_cache):
+        # ve / cos_sin / window_size intentionally ignored — see class docstring.
+        if kv_cache is not None:
+            raise NotImplementedError(
+                "gdn does not support nanochat's KV cache yet — use chunk-mode training only "
+                "(fla's recurrent_state + conv_state cache lives in past_key_values, not in "
+                "nanochat's tensor cache)."
+            )
+        o, _, _ = self.inner(hidden_states=x)
+        return o
+
+    @torch.no_grad()
+    def reset_parameters(self, n_embd_init_std=None):
+        """Re-initialize the inner GatedDeltaNet's parameters in-place after to_empty().
+
+        Match the rest of the model: uniform with std=1/sqrt(n_embd) for matrix params
+        (q/k/v/a/b/g_proj), zeros for the residual o_proj, ones for o_norm.weight. For
+        GDN's special tensors (A_log, dt_bias) we redo fla's __init__ logic on the
+        materialized tensors. Conv1d weights use the standard PyTorch depthwise default
+        (uniform ±1/√K).
+        """
+        s = 3 ** 0.5 * (1.0 / self.n_embd) ** 0.5  # uniform(-s, s) ≡ std == 1/√n_embd
+        m = self.inner
+
+        for lin in (m.q_proj, m.k_proj, m.v_proj, m.a_proj, m.b_proj):
+            torch.nn.init.uniform_(lin.weight, -s, s)
+        if self.use_gate:
+            torch.nn.init.uniform_(m.g_proj.weight, -s, s)
+        torch.nn.init.zeros_(m.o_proj.weight)  # residual stream — start at zero contribution
+
+        if self.use_short_conv:
+            for conv in (m.q_conv1d, m.k_conv1d, m.v_conv1d):
+                k = conv.weight.size(-1)
+                bound = 1.0 / k ** 0.5
+                torch.nn.init.uniform_(conv.weight, -bound, bound)
+                if getattr(conv, "bias", None) is not None:
+                    torch.nn.init.zeros_(conv.bias)
+
+        torch.nn.init.ones_(m.o_norm.weight)  # RMSNorm gain at neutral
+
+        # GDN special tensors. fla draws A from U(0, 16) per head, dt from log-uniform
+        # in (dt_min, dt_max) then clamps + inverse-softplus; we redo that here on the
+        # already-materialized parameter storage. Mark _no_weight_decay so any code
+        # inspecting the flag (e.g. fla utils) keeps WD off.
+        n_v = m.num_v_heads
+        device = m.A_log.device
+        A = torch.empty(n_v, dtype=torch.float32, device=device).uniform_(0, 16)
+        m.A_log.data.copy_(torch.log(A))
+        m.A_log._no_weight_decay = True
+
+        dt_min, dt_max, dt_init_floor = 0.001, 0.1, 1e-4
+        dt = torch.exp(
+            torch.rand(n_v, device=device) * (math.log(dt_max) - math.log(dt_min))
+            + math.log(dt_min)
+        )
+        dt = torch.clamp(dt, min=dt_init_floor)
+        inv_dt = dt + torch.log(-torch.expm1(-dt))
+        m.dt_bias.data.copy_(inv_dt)
+        m.dt_bias._no_weight_decay = True
 
 
 class MLP(nn.Module):
@@ -411,7 +581,9 @@ def make_attention(config, layer_idx):
         return BasisQueryAttention(config, layer_idx)
     if config.attn_kind == "bqa_dyn":
         return DynamicBasisQueryAttention(config, layer_idx)
-    raise ValueError(f"Unknown attn_kind: {config.attn_kind!r} (expected 'gqa', 'bqa', or 'bqa_dyn')")
+    if config.attn_kind == "gdn":
+        return GatedDeltaNetAttention(config, layer_idx)
+    raise ValueError(f"Unknown attn_kind: {config.attn_kind!r} (expected 'gqa', 'bqa', 'bqa_dyn', or 'gdn')")
 
 
 class Block(nn.Module):
@@ -497,10 +669,17 @@ class GPT(nn.Module):
         n_embd = self.config.n_embd
         s = 3**0.5 * n_embd**-0.5 # sqrt(3) multiplier makes sure Uniform achieves the same std as Normal
         for block in self.transformer.h:
-            torch.nn.init.uniform_(block.attn.c_q.weight, -s, s) # weights use Uniform to avoid outliers
-            torch.nn.init.uniform_(block.attn.c_k.weight, -s, s)
-            torch.nn.init.uniform_(block.attn.c_v.weight, -s, s)
-            torch.nn.init.zeros_(block.attn.c_proj.weight) # projections are zero
+            # Attention init: standard MHA/BQA modules expose c_q/c_k/c_v/c_proj. The GDN
+            # wrapper instead exposes a `reset_parameters` hook that handles its own
+            # (q/k/v/g/a/b_proj, conv1d, A_log, dt_bias, o_norm, o_proj) param set —
+            # delegate to it when present.
+            if isinstance(block.attn, GatedDeltaNetAttention):
+                block.attn.reset_parameters()
+            else:
+                torch.nn.init.uniform_(block.attn.c_q.weight, -s, s) # weights use Uniform to avoid outliers
+                torch.nn.init.uniform_(block.attn.c_k.weight, -s, s)
+                torch.nn.init.uniform_(block.attn.c_v.weight, -s, s)
+                torch.nn.init.zeros_(block.attn.c_proj.weight) # projections are zero
             torch.nn.init.uniform_(block.mlp.c_fc.weight, -s * 0.4, s * 0.4)  # 0.4x init scale for c_fc
             torch.nn.init.zeros_(block.mlp.c_proj.weight)
 
@@ -533,7 +712,7 @@ class GPT(nn.Module):
         # shape independent of n_kv_head, instead of letting m collapse with
         # J as a fixed-logit init does. Skip the bonus when J == 1 (degenerate,
         # single basis already has mass 1) or m == 1/J (uniform, logit = 0).
-        # bqa_dyn has a single basis-mixing logit (b_alpha) — use m_k for it.
+        # bqa_dyn has independent K/V mixing logits (b_alpha_k, b_alpha_v) — use both.
         if self.config.attn_kind in ("bqa", "bqa_dyn"):
             n_head, n_kv_head = self.config.n_head, self.config.n_kv_head
             assert n_head % n_kv_head == 0
@@ -552,8 +731,9 @@ class GPT(nn.Module):
                 if self.config.attn_kind == "bqa":
                     pairs = ((block.attn.alpha_k, logit_k), (block.attn.alpha_v, logit_v))
                 else:
-                    torch.nn.init.zeros_(block.attn.alpha_proj.weight)
-                    pairs = ((block.attn.b_alpha, logit_k),)
+                    torch.nn.init.zeros_(block.attn.alpha_proj_k.weight)
+                    torch.nn.init.zeros_(block.attn.alpha_proj_v.weight)
+                    pairs = ((block.attn.b_alpha_k, logit_k), (block.attn.b_alpha_v, logit_v))
                 for a, init_logit in pairs:
                     torch.nn.init.zeros_(a)
                     if init_logit != 0.0:
@@ -680,29 +860,48 @@ class GPT(nn.Module):
         }
 
     def setup_optimizer(self, unembedding_lr=0.004, embedding_lr=0.2, matrix_lr=0.02, weight_decay=0.0, scalar_lr=0.5,
-                        alpha_lr_mult=1.0, alpha_beta1=0.9, alpha_wd=0.0):
+                        alpha_lr_mult=1.0, alpha_beta1=0.9, alpha_wd=0.0,
+                        gdn_lr=0.002, gdn_wd=0.1):
         model_dim = self.config.n_embd
         ddp, rank, local_rank, world_size = get_dist_info()
 
         # Separate out all parameters into groups
-        # BQA's logit tensors (`alpha_k`/`alpha_v` for static BQA, `b_alpha` for bqa_dyn)
-        # are *not* linear operators — they're tensors of independent logits — so they
-        # don't belong in the Muon bucket (Newton-Schulz on logits scrambles them) and
-        # must not get the matrix-group weight decay (which would pull softmax toward
+        # BQA's logit tensors (`alpha_k`/`alpha_v` for static BQA, `b_alpha_k`/`b_alpha_v`
+        # for bqa_dyn) are *not* linear operators — they're tensors of independent logits —
+        # so they don't belong in the Muon bucket (Newton-Schulz on logits scrambles them)
+        # and must not get the matrix-group weight decay (which would pull softmax toward
         # uniform). Pull them out of `transformer.h` into a dedicated AdamW group with
-        # no WD. Note: `alpha_proj.weight` (bqa_dyn) IS a real linear-operator weight
-        # and stays in the matrix/Muon bucket as usual.
+        # no WD. Note: `alpha_proj_{k,v}.weight` (bqa_dyn) ARE real linear-operator weights
+        # and stay in the matrix/Muon bucket as usual.
         def _is_alpha_logit(name):
-            return name.endswith(".alpha_k") or name.endswith(".alpha_v") or name.endswith(".b_alpha")
-        alpha_params = [p for n, p in self.transformer.h.named_parameters() if _is_alpha_logit(n)]
-        matrix_params = [p for n, p in self.transformer.h.named_parameters() if not _is_alpha_logit(n)]
+            return (name.endswith(".alpha_k") or name.endswith(".alpha_v")
+                    or name.endswith(".b_alpha_k") or name.endswith(".b_alpha_v"))
+        # GDN's parameters all go to AdamW — Muon (Newton-Schulz on the update) is geared
+        # toward dense 2D linear-operator weights driving softmax attention; GDN is a
+        # linear-recurrent stack with delta-rule + sigmoid gating where standard Adam-style
+        # adaptive scaling is the published recipe. We use a single AdamW group for the
+        # entire GDN module (linear projections, depthwise conv kernels, A_log, dt_bias,
+        # and o_norm.weight) with one shared LR and one shared WD; this also avoids
+        # Muon's 2D-only constraint for the conv (3D) and per-head scalar (1D) tensors.
+        # Param names under transformer.h are like `0.attn.inner.q_proj.weight`.
+        def _is_gdn_param(name):
+            return ".attn.inner." in ("." + name)
+        named_h = list(self.transformer.h.named_parameters())
+        alpha_params = [p for n, p in named_h if _is_alpha_logit(n)]
+        gdn_params = [p for n, p in named_h if _is_gdn_param(n)]
+        matrix_params = [p for n, p in named_h
+                         if not _is_alpha_logit(n) and not _is_gdn_param(n)]
         value_embeds_params = list(self.value_embeds.parameters())
         embedding_params = list(self.transformer.wte.parameters())
         lm_head_params = list(self.lm_head.parameters())
         resid_params = [self.resid_lambdas]
         x0_params = [self.x0_lambdas]
         smear_params = [self.smear_gate.weight, self.smear_lambda, self.backout_lambda]
-        assert len(list(self.parameters())) == len(matrix_params) + len(alpha_params) + len(embedding_params) + len(lm_head_params) + len(value_embeds_params) + len(resid_params) + len(x0_params) + len(smear_params)
+        assert len(list(self.parameters())) == (
+            len(matrix_params) + len(alpha_params) + len(gdn_params) +
+            len(embedding_params) + len(lm_head_params) +
+            len(value_embeds_params) + len(resid_params) + len(x0_params) + len(smear_params)
+        )
 
         # Scale the LR for the AdamW parameters by ∝1/√dmodel (tuned for 768 dim model)
         dmodel_lr_scale = (model_dim / 768) ** -0.5
@@ -718,7 +917,7 @@ class GPT(nn.Module):
             dict(kind='adamw', params=x0_params, lr=scalar_lr, betas=(0.96, 0.95), eps=1e-10, weight_decay=0.0),  # higher beta1 for x0
             dict(kind='adamw', params=smear_params, lr=0.2, betas=(0.8, 0.95), eps=1e-10, weight_decay=0.0),
         ]
-        # BQA mixing logits (static `alpha_k`/`alpha_v` and bqa_dyn's `b_alpha`): tiny tensors,
+        # BQA mixing logits (static `alpha_k`/`alpha_v` and bqa_dyn's `b_alpha_k`/`b_alpha_v`): tiny tensors,
         # AdamW. Default LR matches the embedding scale; default WD=0 so the
         # GQA-recovering init isn't slowly pulled toward uniform. The
         # `alpha_lr_mult`, `alpha_beta1`, `alpha_wd` overrides exist so this
@@ -729,6 +928,16 @@ class GPT(nn.Module):
                      lr=embedding_lr * dmodel_lr_scale * alpha_lr_mult,
                      betas=(alpha_beta1, 0.95),
                      eps=1e-10, weight_decay=alpha_wd)
+            )
+        # GDN: single AdamW group covering the whole inner module — one shared LR and
+        # one shared WD across linear projections, depthwise convs, A_log, dt_bias and
+        # o_norm.weight. Follows the global warmup/warmdown schedule (same multiplier as
+        # every other group) via get_lr_multiplier in scripts/base_train.py. Override via
+        # --gdn-lr / --gdn-wd on the CLI.
+        if gdn_params:
+            param_groups.append(
+                dict(kind='adamw', params=gdn_params,
+                     lr=gdn_lr, betas=(0.9, 0.95), eps=1e-10, weight_decay=gdn_wd)
             )
         # Muon groups (matrix params, grouped by shape for stacking)
         for shape in sorted({p.shape for p in matrix_params}):
