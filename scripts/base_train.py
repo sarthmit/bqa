@@ -413,16 +413,19 @@ if weight_decay_scaled != args.weight_decay:
 # - --model-kind=fla → single AdamW group covering every parameter, one shared LR + WD.
 #                     Reuses the same warmup/warmdown scheduler below.
 if args.model_kind == "fla":
-    # Single AdamW group covering every parameter (one shared LR + WD). We tried
-    # nanochat's per-group recipe (wte at 0.3, lm_head at 0.008, matrix at fla_lr)
-    # but it produced visibly worse training than the single-group baseline — the
-    # nanochat recipe is calibrated for GPT's wte init (std=0.8) and Muon-driven
-    # matrix updates; in the fla path with std=0.02 wte init and AdamW everywhere,
-    # the high embedding LR appears to destabilize learning. Sticking with single-
-    # group AdamW.
+    # Three AdamW groups matching nanochat's GPT recipe:
+    #   * wte:     embedding_lr   * dmodel_lr_scale * batch_lr_scale (default 0.3)
+    #   * lm_head: unembedding_lr * dmodel_lr_scale * batch_lr_scale (default 0.008)
+    #   * matrix:  fla_lr         * batch_lr_scale (AdamW-tuned; default 0.002)
+    # The high wte/lm_head LRs gave a clear step-12 loss improvement (9.28 → 8.58)
+    # over the single-group baseline. Keep matrix LR at 2e-3 — bumping to 3e-3
+    # was tested and produced an early-step loss spike (step 14: 8.61 → 9.16).
+    fla_dmodel_scale = (model.config.n_embd / 768) ** -0.5
     optimizer = model.setup_optimizer(
         lr=args.fla_lr * batch_lr_scale,
         weight_decay=args.fla_wd,
+        embedding_lr=args.embedding_lr * fla_dmodel_scale * batch_lr_scale,
+        unembedding_lr=args.unembedding_lr * fla_dmodel_scale * batch_lr_scale,
     )
 else:
     optimizer = model.setup_optimizer(
