@@ -73,7 +73,6 @@ for d in "${DEPTHS[@]}"; do
         --core-metric-every=999999 \
         --core-metric-max-per-task=-1 \
         --sample-every=-1 \
-        --save-every=-1 \
         $DEVICE_BATCH_SIZE_ARG \
         2>&1 | tee "$RESULTS_DIR/${TAG}_train.log"
 

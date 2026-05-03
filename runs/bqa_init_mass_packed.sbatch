@@ -87,7 +87,6 @@ run_one() {
         --core-metric-every=999999 \
         --core-metric-max-per-task=-1 \
         --sample-every=-1 \
-        --save-every=-1 \
         --run="$tag" \
         --model-tag="$tag" \
         --seed="$seed" \

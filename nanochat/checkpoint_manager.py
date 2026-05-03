@@ -59,6 +59,9 @@ def save_checkpoint(checkpoint_dir, step, model_data, optimizer_data, meta_data,
         logger.info(f"Saved optimizer state to: {optimizer_path}")
 
 def load_checkpoint(checkpoint_dir, step, device, load_optimizer=False, rank=0):
+    # Support step="latest" to load from the rolling latest checkpoint
+    if step == "latest":
+        return load_latest_checkpoint(checkpoint_dir, device, load_optimizer=load_optimizer, rank=rank)
     # Load the model state
     model_path = os.path.join(checkpoint_dir, f"model_{step:06d}.pt")
     model_data = torch.load(model_path, map_location=device)
@@ -72,6 +75,45 @@ def load_checkpoint(checkpoint_dir, step, device, load_optimizer=False, rank=0):
     with open(meta_path, "r", encoding="utf-8") as f:
         meta_data = json.load(f)
     return model_data, optimizer_data, meta_data
+
+
+def save_latest_checkpoint(checkpoint_dir, step, model_data, optimizer_data, meta_data, rank=0):
+    if rank == 0:
+        os.makedirs(checkpoint_dir, exist_ok=True)
+        # Save the model state parameters
+        model_path = os.path.join(checkpoint_dir, "model_latest.pt")
+        torch.save(model_data, model_path)
+        logger.info(f"Saved latest model parameters to: {model_path} (step {step})")
+        # Save the metadata dict as json
+        meta_path = os.path.join(checkpoint_dir, "meta_latest.json")
+        with open(meta_path, "w", encoding="utf-8") as f:
+            json.dump(meta_data, f, indent=2)
+        logger.info(f"Saved latest metadata to: {meta_path}")
+    # Note that optimizer state is sharded across ranks, so each rank must save its own.
+    if optimizer_data is not None:
+        os.makedirs(checkpoint_dir, exist_ok=True)
+        optimizer_path = os.path.join(checkpoint_dir, f"optim_latest_rank{rank:d}.pt")
+        torch.save(optimizer_data, optimizer_path)
+        logger.info(f"Saved latest optimizer state to: {optimizer_path}")
+
+def load_latest_checkpoint(checkpoint_dir, device, load_optimizer=False, rank=0):
+    # Load the model state
+    model_path = os.path.join(checkpoint_dir, "model_latest.pt")
+    model_data = torch.load(model_path, map_location=device)
+    # Load the optimizer state if requested
+    optimizer_data = None
+    if load_optimizer:
+        optimizer_path = os.path.join(checkpoint_dir, f"optim_latest_rank{rank:d}.pt")
+        optimizer_data = torch.load(optimizer_path, map_location=device)
+    # Load the metadata
+    meta_path = os.path.join(checkpoint_dir, "meta_latest.json")
+    with open(meta_path, "r", encoding="utf-8") as f:
+        meta_data = json.load(f)
+    return model_data, optimizer_data, meta_data
+
+def has_latest_checkpoint(checkpoint_dir):
+    model_path = os.path.join(checkpoint_dir, "model_latest.pt")
+    return os.path.exists(model_path)
 
 
 def build_model(checkpoint_dir, step, device, phase):
@@ -136,12 +178,25 @@ def find_largest_model(checkpoints_dir):
 
 
 def find_last_step(checkpoint_dir):
-    # Look into checkpoint_dir and find model_<step>.pt with the highest step
+    # Look into checkpoint_dir and find the highest numbered model_<step>.pt,
+    # or fall back to model_latest.pt if only a rolling latest checkpoint exists.
     checkpoint_files = glob.glob(os.path.join(checkpoint_dir, "model_*.pt"))
     if not checkpoint_files:
         raise FileNotFoundError(f"No checkpoints found in {checkpoint_dir}")
-    last_step = int(max(os.path.basename(f).split("_")[-1].split(".")[0] for f in checkpoint_files))
-    return last_step
+    # Parse step numbers, skipping non-numeric names like "model_latest.pt"
+    numbered_steps = []
+    for f in checkpoint_files:
+        stem = os.path.basename(f).split("_")[-1].split(".")[0]
+        try:
+            numbered_steps.append(int(stem))
+        except ValueError:
+            continue
+    if numbered_steps:
+        return max(numbered_steps)
+    # No numbered checkpoints — fall back to model_latest.pt
+    if has_latest_checkpoint(checkpoint_dir):
+        return "latest"
+    raise FileNotFoundError(f"No checkpoints found in {checkpoint_dir}")
 
 # -----------------------------------------------------------------------------
 # convenience functions that take into account nanochat's directory structure

@@ -53,12 +53,13 @@ class GPTConfig:
     # init distribution shape is invariant to n_kv_head (no per-depth tuning).
     # K and V are separated because trained-entropy data shows V converges
     # much more concentrated than K (≈0.07 vs ≈0.40 ratio at d16), so m_v can
-    # usefully be initialized higher than m_k. Default 0.58 (symmetric)
-    # reproduces the d12 tuned value (logit≈1.0 at J=3). Set to 1/n_kv_head
+    # usefully be initialized higher than m_k. Defaults (0.70, 0.85) from the
+    # apr28 d16 (m_k, m_v) sweep: argmin at d16 across 1e18/2.15e18/4.64e18,
+    # top-3 at d12 and d20, and beats GQA at d16/4.64e18. Set to 1/n_kv_head
     # for uniform init; n_kv_head=1 falls through to a no-op. bqa_dyn has a
     # single basis-mixing logit, so it uses m_k (m_v is ignored there).
-    bqa_init_mass_k: float = 0.58
-    bqa_init_mass_v: float = 0.58
+    bqa_init_mass_k: float = 0.70
+    bqa_init_mass_v: float = 0.85
     # Sliding window attention pattern string, tiled across layers. Final layer always L.
     # Characters: L=long (full context), S=short (quarter context)
     # Examples: "L"=all full context, "SL"=alternating, "SSL"=two short then one long

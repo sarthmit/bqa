@@ -30,7 +30,7 @@ from nanochat.gpt import GPT, GPTConfig, Linear
 from nanochat.dataloader import tokenizing_distributed_data_loader_bos_bestfit, tokenizing_distributed_data_loader_with_state_bos_bestfit
 from nanochat.common import compute_init, compute_cleanup, print0, DummyWandb, print_banner, get_base_dir, autodetect_device_type, get_peak_flops, COMPUTE_DTYPE, COMPUTE_DTYPE_REASON, is_ddp_initialized
 from nanochat.tokenizer import get_tokenizer, get_token_bytes
-from nanochat.checkpoint_manager import save_checkpoint, load_checkpoint
+from nanochat.checkpoint_manager import load_checkpoint, save_latest_checkpoint, load_latest_checkpoint, has_latest_checkpoint
 from nanochat.loss_eval import evaluate_bpb
 from nanochat.engine import Engine
 from nanochat.flash_attention import HAS_FA3
@@ -53,8 +53,8 @@ parser.add_argument("--aspect-ratio", type=int, default=64, help="model_dim = de
 parser.add_argument("--head-dim", type=int, default=128, help="target head dimension for attention")
 parser.add_argument("--n-kv-head", type=int, default=-1, help="number of key/value heads for GQA / basis K/V heads for BQA. -1 (default) = n_head/2 (2:1 ratio). Pass n_head explicitly for MHA. Must divide n_head.")
 parser.add_argument("--attn-kind", type=str, default="gqa", choices=["gqa", "bqa", "bqa_dyn"], help="attention kind: 'gqa' (grouped-query, default), 'bqa' (basis-query, static per-layer mixing logits), or 'bqa_dyn' (per-query mixing logits = alpha_proj(x) + b_alpha, single softmax over a w-mixed score).")
-parser.add_argument("--bqa-init-mass-k", type=float, default=0.58, help="BQA / bqa_dyn: target softmax probability mass on the GQA-assigned basis for K (alpha_k) at init (in (0,1)). bqa_dyn uses this for its single b_alpha. Default 0.58 reproduces the d12 logit≈1.0 sweet spot.")
-parser.add_argument("--bqa-init-mass-v", type=float, default=0.58, help="BQA: target softmax probability mass on the GQA-assigned basis for V (alpha_v) at init (in (0,1)). Trained-entropy data shows V converges much more concentrated than K, so m_v can usefully be initialized higher than m_k. Ignored for bqa_dyn.")
+parser.add_argument("--bqa-init-mass-k", type=float, default=0.70, help="BQA / bqa_dyn: target softmax probability mass on the GQA-assigned basis for K (alpha_k) at init (in (0,1)). bqa_dyn uses this for its single b_alpha. Default 0.70 from the apr28 d16 (m_k, m_v) sweep — argmin at d16 across 1e18/2.15e18/4.64e18, top-3 at d12 and d20.")
+parser.add_argument("--bqa-init-mass-v", type=float, default=0.85, help="BQA: target softmax probability mass on the GQA-assigned basis for V (alpha_v) at init (in (0,1)). Trained-entropy data shows V converges much more concentrated than K, so m_v can usefully be initialized higher than m_k. Default 0.85 from the apr28 d16 sweep. Ignored for bqa_dyn.")
 parser.add_argument("--alpha-lr-mult", type=float, default=1.0, help="BQA: multiplier on the alpha_{k,v} (and bqa_dyn b_alpha) AdamW LR, on top of the embedding_lr * dmodel scale. 1.0 is the existing baseline.")
 parser.add_argument("--alpha-beta1", type=float, default=0.9, help="BQA: AdamW beta1 for the alpha_{k,v} group. Default 0.9 matches the existing baseline; lower (e.g. 0.5) gives faster response on these tiny logit tensors.")
 parser.add_argument("--alpha-wd", type=float, default=0.0, help="BQA: AdamW weight_decay for the alpha_{k,v} group. Default 0.0 to avoid pulling the softmax toward uniform; small positive values may regularize.")
@@ -83,7 +83,8 @@ parser.add_argument("--eval-tokens", type=int, default=80*524288, help="number o
 parser.add_argument("--core-metric-every", type=int, default=2000, help="evaluate CORE metric every N steps (-1 = disable)")
 parser.add_argument("--core-metric-max-per-task", type=int, default=500, help="examples per task for CORE metric")
 parser.add_argument("--sample-every", type=int, default=2000, help="sample from model every N steps (-1 = disable)")
-parser.add_argument("--save-every", type=int, default=-1, help="save checkpoints every N steps (-1 = only at end)")
+parser.add_argument("--save-latest-every", type=int, default=200, help="save a rolling 'latest' checkpoint every N steps for crash recovery (0 = disable)")
+parser.add_argument("--resume-latest", action="store_true", help="resume from the latest rolling checkpoint if available (overrides --resume-from-step)")
 # Output
 parser.add_argument("--model-tag", type=str, default=None, help="override model tag for checkpoint directory name")
 args = parser.parse_args()
@@ -106,7 +107,7 @@ print0(f"COMPUTE_DTYPE: {COMPUTE_DTYPE} ({COMPUTE_DTYPE_REASON})")
 
 # wandb logging init
 use_dummy_wandb = args.run == "dummy" or not master_process
-wandb_run = DummyWandb() if use_dummy_wandb else wandb.init(project="nanochat", name=args.run, config=user_config)
+wandb_run = DummyWandb() if use_dummy_wandb else wandb.init(project="bqa", name=args.run, config=user_config)
 
 # Flash Attention status
 from nanochat.flash_attention import USE_FA3
@@ -173,12 +174,19 @@ model.init_weights() # 3) All tensors get initialized
 base_dir = get_base_dir()
 output_dirname = args.model_tag if args.model_tag else f"d{args.depth}" # e.g. d12
 checkpoint_dir = os.path.join(base_dir, "base_checkpoints", output_dirname)
-resuming = args.resume_from_step != -1
-if resuming:
+resuming = False
+if args.resume_latest and has_latest_checkpoint(checkpoint_dir):
+    print0(f"Resuming from latest rolling checkpoint")
+    model_data, optimizer_data, meta_data = load_latest_checkpoint(checkpoint_dir, device, load_optimizer=True, rank=ddp_rank)
+    model.load_state_dict(model_data, strict=True, assign=True)
+    del model_data
+    resuming = True
+elif args.resume_from_step != -1:
     print0(f"Resuming optimization from step {args.resume_from_step}")
     model_data, optimizer_data, meta_data = load_checkpoint(checkpoint_dir, args.resume_from_step, device, load_optimizer=True, rank=ddp_rank)
     model.load_state_dict(model_data, strict=True, assign=True)
-    del model_data # free up this memory after the copy
+    del model_data
+    resuming = True
 
 # -----------------------------------------------------------------------------
 # FP8 training initialization and management (this has to be done before torch.compile)
@@ -414,12 +422,14 @@ def get_weight_decay(it):
 # Loop state (variables updated by the training loop)
 if not resuming:
     step = 0
+    resume_step = -1
     val_bpb = None # will be set if eval_every > 0
     min_val_bpb = float("inf")
     smooth_train_loss = 0 # EMA of training loss
     total_training_time = 0 # total wall-clock time of training
 else:
     step = meta_data["step"]
+    resume_step = step
     loop_state = meta_data["loop_state"]
     val_bpb = meta_data["val_bpb"]
     min_val_bpb = loop_state["min_val_bpb"]
@@ -496,23 +506,24 @@ while True:
             print0(tokenizer.decode(sample[0]))
         model.train()
 
-    # save checkpoint: at the end of the run, or every save_every steps, except at the first step or the resume step
-    if last_step or (step > 0 and step != args.resume_from_step and args.save_every > 0 and step % args.save_every == 0):
-        save_checkpoint(
+    # save rolling latest checkpoint: at end of run, or every save_latest_every steps
+    # This overwrites the previous latest checkpoint so only one copy exists on disk.
+    if last_step or (step > 0 and args.save_latest_every > 0 and step % args.save_latest_every == 0):
+        save_latest_checkpoint(
             checkpoint_dir,
             step,
-            orig_model.state_dict(), # model parameters
-            optimizer.state_dict(), # optimizer state
-            { # metadata saved as json
+            orig_model.state_dict(),
+            optimizer.state_dict(),
+            {
                 "step": step,
-                "val_bpb": val_bpb, # loss at last step
+                "val_bpb": val_bpb,
                 "model_config": model_config_kwargs,
-                "user_config": user_config, # inputs to the training script
+                "user_config": user_config,
                 "device_batch_size": args.device_batch_size,
                 "max_seq_len": args.max_seq_len,
                 "total_batch_size": total_batch_size,
                 "dataloader_state_dict": dataloader_state_dict,
-                "loop_state": { # all loop state (other than step) so that we can resume training
+                "loop_state": {
                     "min_val_bpb": min_val_bpb,
                     "smooth_train_loss": smooth_train_loss,
                     "total_training_time": total_training_time,
@@ -619,7 +630,7 @@ while True:
         wandb_run.log(log_data)
 
     # state update
-    first_step_of_run = (step == 0) or (resuming and step == args.resume_from_step)
+    first_step_of_run = (step == 0) or (resuming and step == resume_step)
     step += 1
 
     # The garbage collector is sadly a little bit overactive and for some poorly understood reason,

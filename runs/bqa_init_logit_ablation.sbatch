@@ -6,11 +6,12 @@
 #SBATCH --mem=128G
 #SBATCH --output=/scratch/sarthmit/bqa/runs/logs/attn_compare/%x_%j.log
 
-# Single (depth, flops, mass) BQA run with a configurable --bqa-init-mass.
-# `mass` is the target softmax probability on the GQA-assigned basis at init;
-# the actual logit is derived per n_kv_head so the init shape is depth-invariant.
+# Single (depth, flops) BQA run with a configurable --bqa-init-logit.
+# Probe for whether the small d16 BQA bpb deficit vs GQA is driven by the
+# init-mass on the assigned basis (which falls from ~0.58 at d12/n_kv=3 to
+# ~0.475 at d16/n_kv=4 under the default logit=1.0).
 #
-# Required env: FLOPS, DEPTH, BQA_INIT_MASS, LABEL.
+# Required env: FLOPS, DEPTH, BQA_INIT_LOGIT, LABEL.
 # Reuses MHA num_iters cached at $NANOCHAT_BASE_DIR/attn_compare_${LABEL}_iters.csv.
 
 set -uo pipefail
@@ -21,7 +22,7 @@ export OMP_NUM_THREADS=1
 
 : "${FLOPS:?FLOPS env var is required (e.g. 4.64e18)}"
 : "${DEPTH:?DEPTH env var is required (e.g. 16)}"
-: "${BQA_INIT_MASS:?BQA_INIT_MASS env var is required (e.g. 0.58 or 0.85)}"
+: "${BQA_INIT_LOGIT:?BQA_INIT_LOGIT env var is required (e.g. 1.4 or 0.0)}"
 LABEL="${LABEL:-attncmp_apr28}"
 EVAL_TOKENS=$((100 * 524288))
 
@@ -38,9 +39,9 @@ elif [ "$DEPTH" -ge 20 ]; then DBS=16
 else                           DBS=32
 fi
 
-# Tag uses an underscore-safe encoding of the mass value.
-MASS_TAG=$(printf '%s' "$BQA_INIT_MASS" | tr '.' 'p')
-TAG="${LABEL}_bqa_d${DEPTH}_f${FLOPS}_m${MASS_TAG}"
+# Tag uses an underscore-safe encoding of the logit value.
+LOGIT_TAG=$(printf '%s' "$BQA_INIT_LOGIT" | tr '.' 'p')
+TAG="${LABEL}_bqa_d${DEPTH}_f${FLOPS}_il${LOGIT_TAG}"
 LOG="runs/logs/attn_compare/${TAG}.log"
 
 echo "=== $(date -Is) | host=$(hostname) | TAG=$TAG | NUM_ITERS=$NUM_ITERS | DBS=$DBS ==="
@@ -58,7 +59,7 @@ torchrun --standalone --nproc_per_node=4 -m scripts.base_train -- \
     --run="$TAG" \
     --model-tag="$TAG" \
     --attn-kind=bqa \
-    --bqa-init-mass="$BQA_INIT_MASS" \
+    --bqa-init-logit="$BQA_INIT_LOGIT" \
     2>&1 | tee "$LOG"
 rc=${PIPESTATUS[0]}
 echo "=== $(date -Is) | finished $TAG (exit=$rc) ==="
