@@ -78,6 +78,13 @@ class GPTConfig:
     # m_k and m_v (one per independent K/V mixing-logit head), same as static BQA.
     bqa_init_mass_k: float = 0.70
     bqa_init_mass_v: float = 0.85
+    # bqa_dyn-only: select the kernel used by DynamicBasisQueryAttention.
+    #   False (default) — Q-side fold + SDPA (head_dim widened to J·D, single SDPA call).
+    #   True            — Triton kernel (nanochat/bqa_dyn_triton.py): keeps head_dim=D,
+    #                     no q_eff HBM materialization, ~1.6× fwd / ~2.5× fwd+bwd over
+    #                     the Q-fold path on A100. Backward kernels assert J ≤ 4.
+    # Equivalence verified (cos ≥ 0.999973 bf16, = 1.0 fp32). Ignored for non-bqa_dyn.
+    bqa_dyn_use_triton: bool = False
     # Sliding window attention pattern string, tiled across layers. Final layer always L.
     # Characters: L=long (full context), S=short (quarter context)
     # Examples: "L"=all full context, "SL"=alternating, "SSL"=two short then one long
@@ -372,6 +379,11 @@ class DynamicBasisQueryAttention(nn.Module):
         # before the w_v mix.
         self.ve_gate_channels = 12
         self.ve_gate = Linear(self.ve_gate_channels, self.n_head, bias=False) if has_ve(layer_idx, config.n_layer) else None
+        # Optional Triton fused-kernel path (config.bqa_dyn_use_triton). The kernel
+        # avoids materialising q_eff (B,T,H,J·D) and keeps head_dim=D — single softmax
+        # per (t,h), J basis K-dots inside the kernel. Backward via paired Triton
+        # kernel, no atomics. See nanochat/bqa_dyn_triton.py.
+        self._use_triton = bool(getattr(config, "bqa_dyn_use_triton", False))
 
     def forward(self, x, ve, cos_sin, window_size, kv_cache):
         if kv_cache is not None:
@@ -405,6 +417,26 @@ class DynamicBasisQueryAttention(nn.Module):
         k_basis = apply_rotary_emb(k_basis, cos, sin)
         q = norm(q) * 1.2
         k_basis = norm(k_basis) * 1.2
+
+        if self._use_triton:
+            # Triton fused-kernel path. Lazy import so non-bqa_dyn runs and CPU-only
+            # imports don't pay the Triton init cost.
+            from nanochat.bqa_dyn_triton import bqa_dyn_attn
+            if ve is not None:
+                ve_t = ve.view(B, T, J, D).contiguous()
+                gate = (3 * torch.sigmoid(self.ve_gate(x[..., :self.ve_gate_channels]))).to(x.dtype)
+            else:
+                ve_t = None
+                gate = None
+            y = bqa_dyn_attn(
+                q.contiguous(), k_basis.contiguous(), v_basis.contiguous(),
+                w_k.contiguous(), w_v.contiguous(),
+                ve=ve_t, gate=gate,
+                causal=True, window_size=window_size,
+            )
+            y = y.contiguous().view(B, T, -1)
+            y = self.c_proj(y)
+            return y
 
         # Q-side fold: bake w_k into Q so the basis-mix becomes part of a standard
         # attention score (single softmax over s, no (B,H,T,T,J) tensor).
