@@ -55,8 +55,8 @@ parser.add_argument("--aspect-ratio", type=int, default=64, help="model_dim = de
 parser.add_argument("--head-dim", type=int, default=128, help="target head dimension for attention")
 parser.add_argument("--n-kv-head", type=int, default=-1, help="number of key/value heads for GQA / basis K/V heads for BQA. -1 (default) = n_head/2 (2:1 ratio). Pass n_head explicitly for MHA. Must divide n_head.")
 parser.add_argument("--attn-kind", type=str, default="gqa", choices=["gqa", "bqa", "bqa_dyn", "gdn", "hybrid"], help="attention kind: 'gqa' (grouped-query, default), 'bqa' (basis-query, static per-layer mixing logits), 'bqa_dyn' (per-query independent K/V mixing logits = alpha_proj_{k,v}(x) + b_alpha_{k,v}, single softmax over a w-mixed score), 'gdn' (Gated Delta Networks linear-recurrent attention from fla, chunked parallel kernel; requires n_kv_head == n_head), or 'hybrid' (only valid with --model-kind=fla; per-layer mix of MHA and GDN with MHA fraction set by --alpha).")
-parser.add_argument("--bqa-init-mass-k", type=float, default=0.58, help="BQA / bqa_dyn: target softmax probability mass on the GQA-assigned basis for K (alpha_k / b_alpha_k) at init (in (0,1)). Default 0.58 reproduces the d12 logit≈1.0 sweet spot.")
-parser.add_argument("--bqa-init-mass-v", type=float, default=0.58, help="BQA / bqa_dyn: target softmax probability mass on the GQA-assigned basis for V (alpha_v / b_alpha_v) at init (in (0,1)). Trained-entropy data shows V converges much more concentrated than K, so m_v can usefully be initialized higher than m_k.")
+parser.add_argument("--bqa-init-mass-k", type=float, default=0.70, help="BQA / bqa_dyn: target softmax probability mass on the GQA-assigned basis for K (alpha_k / b_alpha_k) at init (in (0,1)). Default 0.70 from the upstream apr28 d16 (m_k, m_v) sweep — argmin at d16 across 1e18/2.15e18/4.64e18, top-3 at d12 and d20.")
+parser.add_argument("--bqa-init-mass-v", type=float, default=0.85, help="BQA / bqa_dyn: target softmax probability mass on the GQA-assigned basis for V (alpha_v / b_alpha_v) at init (in (0,1)). Trained-entropy data shows V converges much more concentrated than K, so m_v can usefully be initialized higher than m_k. Default 0.85 from the upstream apr28 d16 sweep.")
 parser.add_argument("--alpha-lr-mult", type=float, default=1.0, help="BQA: multiplier on the alpha_{k,v} (static) / b_alpha_{k,v} (bqa_dyn) AdamW LR, on top of the embedding_lr * dmodel scale. 1.0 is the existing baseline.")
 parser.add_argument("--alpha-beta1", type=float, default=0.9, help="BQA: AdamW beta1 for the alpha_{k,v} group. Default 0.9 matches the existing baseline; lower (e.g. 0.5) gives faster response on these tiny logit tensors.")
 parser.add_argument("--alpha-wd", type=float, default=0.0, help="BQA: AdamW weight_decay for the alpha_{k,v} group. Default 0.0 to avoid pulling the softmax toward uniform; small positive values may regularize.")
@@ -719,6 +719,22 @@ while True:
                     hk_sum += -(pk * pk.clamp_min(1e-12).log()).sum(dim=-1).mean().item()
                     hv_sum += -(pv * pv.clamp_min(1e-12).log()).sum(dim=-1).mean().item()
                     n_layers += 1
+                norm_factor = math.log(orig_model.config.n_kv_head)
+                log_data["bqa/H_alpha_k"] = hk_sum / n_layers
+                log_data["bqa/H_alpha_v"] = hv_sum / n_layers
+                log_data["bqa/H_alpha_k_ratio"] = (hk_sum / n_layers) / norm_factor
+                log_data["bqa/H_alpha_v_ratio"] = (hv_sum / n_layers) / norm_factor
+        elif orig_model.config.attn_kind == "bqa_dyn":
+            # Per-token mixing entropy is computed inside the forward and stashed on
+            # each attention module as `_last_h_w_{k,v}` (rank 0's last microbatch).
+            hk_sum, hv_sum, n_layers = 0.0, 0.0, 0
+            for block in orig_model.transformer.h:
+                attn = block.attn
+                if hasattr(attn, "_last_h_w_k") and attn._last_h_w_k is not None:
+                    hk_sum += attn._last_h_w_k.item()
+                    hv_sum += attn._last_h_w_v.item()
+                    n_layers += 1
+            if n_layers > 0:
                 norm_factor = math.log(orig_model.config.n_kv_head)
                 log_data["bqa/H_alpha_k"] = hk_sum / n_layers
                 log_data["bqa/H_alpha_v"] = hv_sum / n_layers

@@ -71,12 +71,13 @@ class GPTConfig:
     # init distribution shape is invariant to n_kv_head (no per-depth tuning).
     # K and V are separated because trained-entropy data shows V converges
     # much more concentrated than K (≈0.07 vs ≈0.40 ratio at d16), so m_v can
-    # usefully be initialized higher than m_k. Default 0.58 (symmetric)
-    # reproduces the d12 tuned value (logit≈1.0 at J=3). Set to 1/n_kv_head
+    # usefully be initialized higher than m_k. Defaults (0.70, 0.85) from the
+    # upstream apr28 d16 (m_k, m_v) sweep: argmin at d16 across 1e18/2.15e18/4.64e18,
+    # top-3 at d12 and d20, and beats GQA at d16/4.64e18. Set to 1/n_kv_head
     # for uniform init; n_kv_head=1 falls through to a no-op. bqa_dyn uses both
     # m_k and m_v (one per independent K/V mixing-logit head), same as static BQA.
-    bqa_init_mass_k: float = 0.58
-    bqa_init_mass_v: float = 0.58
+    bqa_init_mass_k: float = 0.70
+    bqa_init_mass_v: float = 0.85
     # Sliding window attention pattern string, tiled across layers. Final layer always L.
     # Characters: L=long (full context), S=short (quarter context)
     # Examples: "L"=all full context, "SL"=alternating, "SSL"=two short then one long
@@ -382,8 +383,15 @@ class DynamicBasisQueryAttention(nn.Module):
         # alpha_k / alpha_v). softmax in fp32 for stability, cast to compute dtype.
         alpha_logits_k = self.alpha_proj_k(x).view(B, T, H, J) + self.b_alpha_k
         alpha_logits_v = self.alpha_proj_v(x).view(B, T, H, J) + self.b_alpha_v
-        w_k = F.softmax(alpha_logits_k.float(), dim=-1).to(x.dtype)  # (B, T, H, J)
-        w_v = F.softmax(alpha_logits_v.float(), dim=-1).to(x.dtype)  # (B, T, H, J)
+        w_k_f = F.softmax(alpha_logits_k.float(), dim=-1)  # (B, T, H, J), fp32
+        w_v_f = F.softmax(alpha_logits_v.float(), dim=-1)
+        w_k = w_k_f.to(x.dtype)
+        w_v = w_v_f.to(x.dtype)
+        # Mean per-token mixing entropy (over B, T, H), stashed for wandb logging.
+        # Uniform-init value = log(J); collapses to 0 as alpha specialises.
+        with torch.no_grad():
+            self._last_h_w_k = -(w_k_f * w_k_f.clamp_min(1e-12).log()).sum(dim=-1).mean()
+            self._last_h_w_v = -(w_v_f * w_v_f.clamp_min(1e-12).log()).sum(dim=-1).mean()
 
         # Standard projections.
         q = self.c_q(x).view(B, T, H, D)
