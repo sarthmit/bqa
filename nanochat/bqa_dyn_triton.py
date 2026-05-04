@@ -107,6 +107,11 @@ def _bqa_dyn_attn_fwd_kernel(
         mask_s = offs_s < T
 
         # score[m, s] = sm_scale · Σ_j w_k[m, j] · (q @ K[s, j, :]^T)
+        # Tried a single fused matmul with q_eff = w_k ⊙ q stacked to (BLOCK_M, J·D)
+        # — regressed on A100 because the K=512 contracting dim forced BLOCK_M down
+        # to 32 and the lost data reuse swamped the bigger-MMA win. J small dots
+        # with BLOCK_M=64 wins on A100; revisit on Hopper where TMA + larger SRAM
+        # might flip the tradeoff.
         score = tl.zeros([BLOCK_M, BLOCK_N], dtype=tl.float32)
         for j in tl.static_range(J):
             k_ptrs = (
