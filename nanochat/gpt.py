@@ -39,9 +39,11 @@ class GPTConfig:
     #   "bqa"      — Basis Query Attention: each query head attends to a learned softmax mixture
     #                of all n_kv_head basis K/V heads (alpha logits, shape (n_head, n_kv_head)).
     #                At init, alpha is set so BQA recovers GQA exactly; training can then deviate.
-    #   "bqa_dyn"  — Per-query logit-mix BQA: mixing logits are produced per token by a small
-    #                Linear `alpha_proj(x)` plus a learned static bias `b_alpha`. Each query
-    #                position picks its own basis combination, applied to *every* past key.
+    #   "bqa_dyn"  — Per-query logit-mix BQA: independent K and V mixing logits are produced
+    #                per token by Linear `alpha_proj_{k,v}(x)` plus learned static biases
+    #                `b_alpha_{k,v}` (mirrors BQA static's alpha_k / alpha_v). Each query
+    #                position picks its own (separate) K and V basis combinations, applied
+    #                to every past key / past value.
     #                Implemented by materializing per-pair basis scores S[b,h,t,s,j] and
     #                summing across j with w[b,t,h,j] BEFORE softmax — single softmax per
     #                (t,h), unlike Mixture-of-Softmaxes. See DynamicBasisQueryAttention.
@@ -54,10 +56,10 @@ class GPTConfig:
     # K and V are separated because trained-entropy data shows V converges
     # much more concentrated than K (≈0.07 vs ≈0.40 ratio at d16), so m_v can
     # usefully be initialized higher than m_k. Defaults (0.70, 0.85) from the
-    # apr28 d16 (m_k, m_v) sweep: argmin at d16 across 1e18/2.15e18/4.64e18,
+    # upstream apr28 d16 (m_k, m_v) sweep: argmin at d16 across 1e18/2.15e18/4.64e18,
     # top-3 at d12 and d20, and beats GQA at d16/4.64e18. Set to 1/n_kv_head
-    # for uniform init; n_kv_head=1 falls through to a no-op. bqa_dyn has a
-    # single basis-mixing logit, so it uses m_k (m_v is ignored there).
+    # for uniform init; n_kv_head=1 falls through to a no-op. bqa_dyn uses both
+    # m_k and m_v (one per independent K/V mixing-logit head), same as static BQA.
     bqa_init_mass_k: float = 0.70
     bqa_init_mass_v: float = 0.85
     # Sliding window attention pattern string, tiled across layers. Final layer always L.
@@ -298,19 +300,32 @@ class BasisQueryAttention(nn.Module):
 
 class DynamicBasisQueryAttention(nn.Module):
     """
-    Per-query logit-mix BQA. Each query position t produces its own mixing distribution
-    w[t, h, :] over the n_kv_head basis K/V heads via softmax(alpha_proj(x_t) + b_alpha).
-    Effective per-query K/V are then  K_eff[t,s,h] = Σ_j w[t,h,j] · K_basis[s,j], so the
-    mix depends on BOTH the query position (via w) and the key position (via K_basis).
-    A SINGLE softmax over s is applied to the w-mixed scores — this is *not* mixture-of-
-    softmaxes (which would softmax J times then mix outputs). See the BQA paper-style
-    derivation in scripts/bqa_bench.py / training notes.
+    Per-query logit-mix BQA with INDEPENDENT K and V mixings (mirrors BQA static's
+    alpha_k / alpha_v structure). Each query position t produces its own K and V
+    mixing distributions w_k[t, h, :], w_v[t, h, :] over the n_kv_head basis K/V
+    heads via softmax(alpha_proj_{k,v}(x_t) + b_alpha_{k,v}). Effective per-query
+    K_eff[t,s,h] = Σ_j w_k[t,h,j] · K_basis[s,j]; effective per-query V is given
+    by O[t,h,d] = Σ_j w_v[t,h,j] · (Σ_s p[t,s,h] · V_basis[s,j,d]). A SINGLE
+    softmax over s is applied to the w_k-mixed scores (not mixture-of-softmaxes).
 
-    Implementation: materialize basis scores S[b,h,t,s,j] = ⟨Q[b,t,h], K_basis[b,s,j]⟩,
-    collapse with w to per-pair scores, softmax, then aggregate V by the linearity-factored
-    form O[t,h] = Σ_j w[t,h,j] · (Σ_s p[t,s,h] · V_basis[s,j]). Memory of S is
-    (B, H, T, T, J) — sized so this fits on one A100 80GB at d=12, J=3 with B≤8 (no
-    activation checkpointing needed). For larger configs reduce --device-batch-size.
+    ve gate is per-query-head (n_head outputs, matching BQA static): gate(x_s)[h]
+    modulates the VE contribution from source position s through the same w_v
+    path. Implemented by baking the gate into the attention weights for the VE
+    branch (p_gated[t,s,h] = p[t,s,h] · gate[s,h]) and adding the resulting VE
+    aggregate to the V aggregate before the per-query w_v mix.
+
+    Implementation: Q-side fold (algebraically identical to materializing
+    S[b,h,t,s,j] but uses standard attention infra). Define
+        Q_w[b,t,h,j,d] = w_k[b,t,h,j] · Q[b,t,h,d],
+    then
+        score[t,s,h] = Σⱼ wₖ[t,h,j]·⟨Q[t,h], K_basis[s,j]⟩
+                     = Σ_(j,d) Q_w[t,h,(j,d)] · K_basis_flat[s,(j,d)]
+                     = ⟨Q_w_flat[t,h,:], K_basis_flat[s,:]⟩  with head_dim_eff = J·D.
+    That's a standard MHA score with widened head dim — single softmax over s, no
+    (B,H,T,T,J) tensor anywhere. Per-head V is `V_basis + gate(x_s)·ve` (per source,
+    per head, matching BQA static's ve gate). Per-query w_v mix is applied OUTSIDE
+    the kernel as a small einsum: y[t,h,d] = Σⱼ wᵥ[t,h,j]·o[t,h,j,d].
+    Memory drops from O(B·H·T²·J) to O(B·T·H·J·D); DBS can be similar to MHA.
     """
     def __init__(self, config, layer_idx):
         super().__init__()
@@ -325,14 +340,19 @@ class DynamicBasisQueryAttention(nn.Module):
         self.c_k = Linear(self.n_embd, self.n_kv_head * self.head_dim, bias=False)
         self.c_v = Linear(self.n_embd, self.n_kv_head * self.head_dim, bias=False)
         self.c_proj = Linear(self.n_embd, self.n_embd, bias=False)
-        # Input-dependent mixing-logit projection. Init to zero so step-0 logits = b_alpha.
-        self.alpha_proj = Linear(self.n_embd, self.n_head * self.n_kv_head, bias=False)
-        # Static bias on mixing logits — initialized in GPT.init_weights to recover GQA.
-        self.b_alpha = nn.Parameter(torch.zeros(self.n_head, self.n_kv_head))
-        # ve gating shaped per basis head (same as GQA) — ve fuses into V_basis pre-mix
-        # since the ve contribution is per-key-position and basis-indexed.
+        # Independent K and V mixing-logit projections (mirrors BQA static's
+        # alpha_k / alpha_v). alpha_proj_{k,v}.weight init to zero so step-0
+        # logits = b_alpha_{k,v} (GQA-leaning init in GPT.init_weights).
+        self.alpha_proj_k = Linear(self.n_embd, self.n_head * self.n_kv_head, bias=False)
+        self.alpha_proj_v = Linear(self.n_embd, self.n_head * self.n_kv_head, bias=False)
+        # Static biases on K and V mixing logits — initialized to recover GQA.
+        self.b_alpha_k = nn.Parameter(torch.zeros(self.n_head, self.n_kv_head))
+        self.b_alpha_v = nn.Parameter(torch.zeros(self.n_head, self.n_kv_head))
+        # ve gate: per-query-head (matches BQA static; n_head outputs). Each source
+        # position s produces gate(x_s)[h] that modulates the VE attention contribution
+        # before the w_v mix.
         self.ve_gate_channels = 12
-        self.ve_gate = Linear(self.ve_gate_channels, self.n_kv_head, bias=False) if has_ve(layer_idx, config.n_layer) else None
+        self.ve_gate = Linear(self.ve_gate_channels, self.n_head, bias=False) if has_ve(layer_idx, config.n_layer) else None
 
     def forward(self, x, ve, cos_sin, window_size, kv_cache):
         if kv_cache is not None:
@@ -340,52 +360,68 @@ class DynamicBasisQueryAttention(nn.Module):
         B, T, C = x.size()
         H, J, D = self.n_head, self.n_kv_head, self.head_dim
 
-        # Per-query mixing weights. softmax in fp32 for stability, cast to compute dtype.
-        alpha_logits = self.alpha_proj(x).view(B, T, H, J) + self.b_alpha
-        w = F.softmax(alpha_logits.float(), dim=-1).to(x.dtype)  # (B, T, H, J)
+        # Per-query mixing weights: independent K and V (matches BQA static's
+        # alpha_k / alpha_v). softmax in fp32 for stability, cast to compute dtype.
+        alpha_logits_k = self.alpha_proj_k(x).view(B, T, H, J) + self.b_alpha_k
+        alpha_logits_v = self.alpha_proj_v(x).view(B, T, H, J) + self.b_alpha_v
+        w_k_f = F.softmax(alpha_logits_k.float(), dim=-1)  # (B, T, H, J), fp32
+        w_v_f = F.softmax(alpha_logits_v.float(), dim=-1)
+        w_k = w_k_f.to(x.dtype)
+        w_v = w_v_f.to(x.dtype)
+        # Mean per-token mixing entropy (over B, T, H), stashed for wandb logging.
+        # Uniform-init value = log(J); collapses to 0 as alpha specialises.
+        with torch.no_grad():
+            self._last_h_w_k = -(w_k_f * w_k_f.clamp_min(1e-12).log()).sum(dim=-1).mean()
+            self._last_h_w_v = -(w_v_f * w_v_f.clamp_min(1e-12).log()).sum(dim=-1).mean()
 
         # Standard projections.
         q = self.c_q(x).view(B, T, H, D)
         k_basis = self.c_k(x).view(B, T, J, D)
         v_basis = self.c_v(x).view(B, T, J, D)
 
-        # ve residual is per-key-position and basis-indexed → folds into V_basis directly,
-        # before the dynamic mix (this is identical to static-BQA's handling).
-        if ve is not None:
-            ve = ve.view(B, T, J, D)
-            gate = 3 * torch.sigmoid(self.ve_gate(x[..., :self.ve_gate_channels]))  # (B, T, J)
-            v_basis = v_basis + gate.unsqueeze(-1) * ve
-
         # Rotary on q (per query position) and k_basis (per key position). QK norm + ×1.2.
+        # Note: rotary acts on the last dim (D), so it MUST run before the J-fold below.
         cos, sin = cos_sin
         q = apply_rotary_emb(q, cos, sin)
         k_basis = apply_rotary_emb(k_basis, cos, sin)
         q = norm(q) * 1.2
         k_basis = norm(k_basis) * 1.2
 
-        scale = 1.0 / (self.head_dim ** 0.5)
-        # (1) Per-pair basis scores. Memory: (B, H, T, T, J).
-        # S[b, h, t, s, j] = ⟨Q[b, t, h], K_basis[b, s, j]⟩
-        S = torch.einsum('bthd,bsjd->bhtsj', q, k_basis) * scale
-        # (2) Mix with per-query w to get a single score per (t, s, h).
-        score = torch.einsum('bhtsj,bthj->bhts', S, w)
+        # Q-side fold: bake w_k into Q so the basis-mix becomes part of a standard
+        # attention score (single softmax over s, no (B,H,T,T,J) tensor).
+        # Q_eff[b, t, h, j, d] = w_k[b, t, h, j] · Q[b, t, h, d], then flatten (j,d).
+        # Pre-scale by sqrt(J) so SDPA's default 1/sqrt(J·D) becomes 1/sqrt(D),
+        # matching the per-basis-D scale of the explicit formulation.
+        q_eff = (w_k.unsqueeze(-1) * q.unsqueeze(-2)).reshape(B, T, H, J * D) * (J ** 0.5)
 
-        # (3) Causal + sliding-window mask, then softmax over key positions.
-        device = score.device
-        row = torch.arange(T, device=device).view(-1, 1)
-        col = torch.arange(T, device=device).view(1, -1)
-        mask = col <= row
-        win = window_size[0]
-        if win >= 0 and win < T:
-            mask = mask & ((row - col) <= win)
-        score = score.masked_fill(~mask, float('-inf'))
-        p = F.softmax(score, dim=-1)  # (B, H, T, T)
+        # K_eff: same K_basis for every query head (no per-head mix on K side — the
+        # mix lives in Q). Replicate K_basis across H so flash_attn shim sees a
+        # standard num_q_heads == num_kv_heads layout. (Could use enable_gqa with
+        # num_kv_heads=1, but per-head V below requires num_kv_heads=H anyway —
+        # see ve handling — so we keep K and V symmetric for one SDPA call.)
+        k_eff = k_basis.unsqueeze(2).expand(B, T, H, J, D).reshape(B, T, H, J * D)
 
-        # (4) V aggregation, factored: J p-weighted sums of V_basis, then per-query mix.
-        # O'[b, t, h, j, d] = Σ_s p[b, h, t, s] · V_basis[b, s, j, d]
-        O_prime = torch.einsum('bhts,bsjd->bthjd', p, v_basis)
-        # O[b, t, h, d] = Σ_j w[b, t, h, j] · O'[b, t, h, j, d]
-        y = torch.einsum('bthj,bthjd->bthd', w, O_prime)
+        # V_eff: per-head V combines V_basis with optional ve residual. ve gate is
+        # per-source-per-head (matches BQA static), applied at the source position
+        # by adding gate(x_s)[h] · ve[s, j, d] to V_basis[s, j, d].
+        if ve is not None:
+            ve = ve.view(B, T, J, D)
+            gate = 3 * torch.sigmoid(self.ve_gate(x[..., :self.ve_gate_channels]))  # (B, T, H)
+            # broadcast: V_basis (B,T,1,J,D) + gate (B,T,H,1,1) * ve (B,T,1,J,D)
+            v_combined = v_basis.unsqueeze(2) + gate[..., None, None] * ve.unsqueeze(2)
+            v_eff = v_combined.reshape(B, T, H, J * D)
+        else:
+            v_eff = v_basis.unsqueeze(2).expand(B, T, H, J, D).reshape(B, T, H, J * D)
+
+        # Standard attention with widened head_dim = J·D. The SDPA fallback in
+        # nanochat.flash_attention handles head_dim > 128 via mem_efficient/math
+        # backends. Causal + sliding window come for free.
+        o = flash_attn.flash_attn_func(q_eff, k_eff, v_eff, causal=True, window_size=window_size)
+        o = o.reshape(B, T, H, J, D)
+
+        # Per-query w_v mix to per-query-head output (the only "outside the kernel"
+        # piece — wᵥ is t-indexed, can't be folded into V at source).
+        y = torch.einsum('bthj,bthjd->bthd', w_v, o)
 
         y = y.contiguous().view(B, T, -1)
         y = self.c_proj(y)
@@ -534,7 +570,7 @@ class GPT(nn.Module):
         # shape independent of n_kv_head, instead of letting m collapse with
         # J as a fixed-logit init does. Skip the bonus when J == 1 (degenerate,
         # single basis already has mass 1) or m == 1/J (uniform, logit = 0).
-        # bqa_dyn has a single basis-mixing logit (b_alpha) — use m_k for it.
+        # bqa_dyn has independent K/V mixing logits (b_alpha_k, b_alpha_v) — use both.
         if self.config.attn_kind in ("bqa", "bqa_dyn"):
             n_head, n_kv_head = self.config.n_head, self.config.n_kv_head
             assert n_head % n_kv_head == 0
@@ -553,8 +589,9 @@ class GPT(nn.Module):
                 if self.config.attn_kind == "bqa":
                     pairs = ((block.attn.alpha_k, logit_k), (block.attn.alpha_v, logit_v))
                 else:
-                    torch.nn.init.zeros_(block.attn.alpha_proj.weight)
-                    pairs = ((block.attn.b_alpha, logit_k),)
+                    torch.nn.init.zeros_(block.attn.alpha_proj_k.weight)
+                    torch.nn.init.zeros_(block.attn.alpha_proj_v.weight)
+                    pairs = ((block.attn.b_alpha_k, logit_k), (block.attn.b_alpha_v, logit_v))
                 for a, init_logit in pairs:
                     torch.nn.init.zeros_(a)
                     if init_logit != 0.0:
@@ -686,15 +723,16 @@ class GPT(nn.Module):
         ddp, rank, local_rank, world_size = get_dist_info()
 
         # Separate out all parameters into groups
-        # BQA's logit tensors (`alpha_k`/`alpha_v` for static BQA, `b_alpha` for bqa_dyn)
-        # are *not* linear operators — they're tensors of independent logits — so they
-        # don't belong in the Muon bucket (Newton-Schulz on logits scrambles them) and
-        # must not get the matrix-group weight decay (which would pull softmax toward
+        # BQA's logit tensors (`alpha_k`/`alpha_v` for static BQA, `b_alpha_k`/`b_alpha_v`
+        # for bqa_dyn) are *not* linear operators — they're tensors of independent logits —
+        # so they don't belong in the Muon bucket (Newton-Schulz on logits scrambles them)
+        # and must not get the matrix-group weight decay (which would pull softmax toward
         # uniform). Pull them out of `transformer.h` into a dedicated AdamW group with
-        # no WD. Note: `alpha_proj.weight` (bqa_dyn) IS a real linear-operator weight
-        # and stays in the matrix/Muon bucket as usual.
+        # no WD. Note: `alpha_proj_{k,v}.weight` (bqa_dyn) ARE real linear-operator weights
+        # and stay in the matrix/Muon bucket as usual.
         def _is_alpha_logit(name):
-            return name.endswith(".alpha_k") or name.endswith(".alpha_v") or name.endswith(".b_alpha")
+            return (name.endswith(".alpha_k") or name.endswith(".alpha_v")
+                    or name.endswith(".b_alpha_k") or name.endswith(".b_alpha_v"))
         alpha_params = [p for n, p in self.transformer.h.named_parameters() if _is_alpha_logit(n)]
         matrix_params = [p for n, p in self.transformer.h.named_parameters() if not _is_alpha_logit(n)]
         value_embeds_params = list(self.value_embeds.parameters())
@@ -719,7 +757,7 @@ class GPT(nn.Module):
             dict(kind='adamw', params=x0_params, lr=scalar_lr, betas=(0.96, 0.95), eps=1e-10, weight_decay=0.0),  # higher beta1 for x0
             dict(kind='adamw', params=smear_params, lr=0.2, betas=(0.8, 0.95), eps=1e-10, weight_decay=0.0),
         ]
-        # BQA mixing logits (static `alpha_k`/`alpha_v` and bqa_dyn's `b_alpha`): tiny tensors,
+        # BQA mixing logits (static `alpha_k`/`alpha_v` and bqa_dyn's `b_alpha_k`/`b_alpha_v`): tiny tensors,
         # AdamW. Default LR matches the embedding scale; default WD=0 so the
         # GQA-recovering init isn't slowly pulled toward uniform. The
         # `alpha_lr_mult`, `alpha_beta1`, `alpha_wd` overrides exist so this
