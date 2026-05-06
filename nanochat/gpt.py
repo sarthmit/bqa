@@ -365,6 +365,14 @@ class DynamicBasisQueryAttention(nn.Module):
         # per (t,h), J basis K-dots inside the kernel. Backward via paired Triton
         # kernel, no atomics. See nanochat/bqa_dyn_triton.py.
         self._use_triton = bool(getattr(config, "bqa_dyn_use_triton", False))
+        # When the Triton kernel path is active, force a graph-break here so
+        # AOT autograd / inductor don't try to compile around the hand-written
+        # kernel. Inductor compiling those surroundings busts H100 SMEM at
+        # J ≥ 8 (e.g. d=20 full J=10 backward needed 264 KB → no valid config).
+        # The wrap is applied in __init__ on the bound method so __call__'s
+        # dispatch through self.forward picks it up.
+        if self._use_triton:
+            self.forward = torch.compiler.disable(self.forward)
 
     def forward(self, x, ve, cos_sin, window_size, kv_cache):
         if kv_cache is not None:

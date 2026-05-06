@@ -42,6 +42,11 @@ arch_args() {
         mha) echo "--attn-kind=gqa --n-kv-head=$(( depth / 2 ))" ;;
         gqa) echo "--attn-kind=gqa" ;;
         bqa) echo "--attn-kind=bqa" ;;
+        bqafull) echo "--attn-kind=bqa --n-kv-head=$(( depth / 2 ))" ;;
+        bqa_dyn) echo "--attn-kind=bqa_dyn" ;;
+        bqa_dyn_full) echo "--attn-kind=bqa_dyn --n-kv-head=$(( depth / 2 ))" ;;
+        bqa_dyn_triton) echo "--attn-kind=bqa_dyn --bqa-dyn-use-triton" ;;
+        bqa_dyn_triton_full) echo "--attn-kind=bqa_dyn --bqa-dyn-use-triton --n-kv-head=$(( depth / 2 ))" ;;
         *) echo "ERROR: unknown arch '$arch'" >&2; return 1 ;;
     esac
 }
@@ -107,7 +112,7 @@ run_one() {
 order_archs() {
     local archs="$1"
     local out=""
-    for want in mha gqa bqa; do
+    for want in mha gqa bqa bqafull bqa_dyn bqa_dyn_full bqa_dyn_triton bqa_dyn_triton_full; do
         for a in $archs; do
             if [ "$a" = "$want" ]; then out="$out $want"; fi
         done

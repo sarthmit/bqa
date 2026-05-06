@@ -263,15 +263,21 @@ def bqa_dyn_attn_triton_fwd(
     # Triton requires power-of-two block sizes for tl.dot. D must be PoT.
     assert (D & (D - 1)) == 0 and D >= 16, f"head_dim must be PoT >= 16, got {D}"
 
-    # Block-size defaults tuned for A100's 164KB shared-mem limit.
-    #   bf16 / no-ve : 64×64, num_stages=2 (best — pipelined, large reductions)
-    #   bf16 / ve    : 64×32, num_stages=2 (extra ve tile per iter; shrink BLOCK_N
-    #                                       to keep pipelining)
-    #   fp32         : 32×32, num_stages=1 (every tile doubles vs bf16)
+    # Block-size defaults. Forward kernel SMEM is dominated by the static_range(J)
+    # K/V tile loads — J × BLOCK_N × D × 2 (bf16) bytes per stage — so big-J
+    # configurations need smaller BLOCK_N. At J ≥ 4 we use BLOCK_M=128, BLOCK_N=16
+    # which fits H100's ~228 KB cap up to J=14 and gives substantially better
+    # tensor-core utilization (128×16 reduction tile) than the earlier 64×32.
+    #   J ≤ 3   : 64×64 stages=2 — tuned fast path for d ≤ 12 half (J=3)
+    #   J ≥ 4   : 128×16 stages=1 — bigger reductions, fits SMEM through J=16
+    #   fp32    : 32×32 stages=1 (every tile doubles vs bf16)
     if block_m is None or block_n is None:
         if q.dtype == torch.float32:
             block_m = block_m or 32
             block_n = block_n or 32
+        elif J >= 4:
+            block_m = block_m or 128
+            block_n = block_n or 16
         elif has_ve:
             block_m = block_m or 64
             block_n = block_n or 32
@@ -279,7 +285,10 @@ def bqa_dyn_attn_triton_fwd(
             block_m = block_m or 64
             block_n = block_n or 64
     if num_stages is None:
-        num_stages = 1 if q.dtype == torch.float32 else 2
+        if q.dtype == torch.float32 or J >= 4:
+            num_stages = 1
+        else:
+            num_stages = 2
 
     assert (block_m & (block_m - 1)) == 0
     assert (block_n & (block_n - 1)) == 0
@@ -425,9 +434,12 @@ def _bqa_dyn_attn_bwd_dq_kernel(
         offs_s = s_blk + offs_n_base
         mask_s = offs_s < T
 
-        # Score recomp. Save qk_j for use in Phase 4 below — for J=3 / BLOCK_M=32
-        # / BLOCK_N=32 the J tiles are 12KB total; fits comfortably and removes
-        # the need to reload K_j twice.
+        # Score recomp + qk_j cache. Only the first 4 qk_j tiles are cached
+        # (slots 0..3); for J > 4 we recompute qk_j inline in Phase 4 below.
+        # Reason: at J ≥ 4 we use BLOCK_M=128 in dQ for tensor-core efficiency,
+        # so each cache slot would be 8 KB; caching all J tiles would bust SMEM.
+        # The recompute is a single q × K_j matmul per j per s_blk (~131K flops
+        # with 128×128×16), tiny vs the rest of the bwd path.
         score = tl.zeros([BLOCK_M, BLOCK_N], dtype=tl.float32)
         qk_0 = tl.zeros([BLOCK_M, BLOCK_N], dtype=tl.float32)
         qk_1 = tl.zeros([BLOCK_M, BLOCK_N], dtype=tl.float32)
@@ -485,22 +497,27 @@ def _bqa_dyn_attn_bwd_dq_kernel(
         dscore_dt = dscore.to(q.dtype)
 
         for j in tl.static_range(J):
-            # Reload K_j for the dq matmul (we need K, not just qk).
+            # Reload K_j for the dq matmul (Triton tile scope can't hold full
+            # 2× K reloads across phases). For J ≤ 8 reuse the qk_j cached in
+            # Phase 1; for J > 8 recompute qk_j here (cache busts SMEM at large J).
             k_ptrs = K + b * sKb + j * sKj + offs_s[:, None] * sKt + offs_d[None, :] * sKd
             k = tl.load(k_ptrs, mask=mask_s[:, None], other=0.0)
 
             wk_j_ptrs = WK + b * sWKb + h * sWKh + offs_m * sWKt + j * sWKj
             wk_j_col = tl.load(wk_j_ptrs, mask=mask_m, other=0.0).to(tl.float32)
 
-            # Reuse qk_j saved from Phase 1.
-            qk_j = qk_0
+            # Use cached qk_j for j ∈ [0, 3]; recompute for j ≥ 4 (saves SMEM).
+            if j == 0:
+                qk_j = qk_0
             if j == 1:
                 qk_j = qk_1
             if j == 2:
                 qk_j = qk_2
             if j == 3:
                 qk_j = qk_3
-
+            if J > 4:
+                if j >= 4:
+                    qk_j = tl.dot(q, tl.trans(k))
             dw_k_col = tl.sum(dscore * qk_j, axis=1) * sm_scale
             dw_k_acc += dw_k_col[:, None] * (offs_j_pad == j).to(tl.float32)[None, :]
 
@@ -573,17 +590,46 @@ def _bqa_dyn_attn_bwd_dkv_kernel(
         gate_n = tl.load(g_ptrs_n, mask=mask_n, other=0.0).to(tl.float32)
 
     # Per-(b, h, n_block, j) accumulators stored as separate Triton tiles. Triton
-    # SSA-tracks these across the m loop. We reserve up to J=4 slots; static_range
-    # writes only the first J. Using a 3D tile here was 3-4× slower (the broadcast
+    # SSA-tracks these across the m loop. Slots 4..15 are gated on the constexpr
+    # J so they don't allocate SMEM in the J ≤ 4 fast path (Triton doesn't DCE
+    # unused tile vars reliably; declaring them unconditionally bloats SMEM and
+    # busts H100 at small J). Using a 3D tile here was 3-4× slower (the broadcast
     # multiply against a J-onehot produces wide ops that the compiler doesn't vectorize).
-    dK_0 = tl.zeros([BLOCK_N, D], dtype=tl.float32)
-    dK_1 = tl.zeros([BLOCK_N, D], dtype=tl.float32)
-    dK_2 = tl.zeros([BLOCK_N, D], dtype=tl.float32)
-    dK_3 = tl.zeros([BLOCK_N, D], dtype=tl.float32)
-    dV_0 = tl.zeros([BLOCK_N, D], dtype=tl.float32)
-    dV_1 = tl.zeros([BLOCK_N, D], dtype=tl.float32)
-    dV_2 = tl.zeros([BLOCK_N, D], dtype=tl.float32)
-    dV_3 = tl.zeros([BLOCK_N, D], dtype=tl.float32)
+    dK_0  = tl.zeros([BLOCK_N, D], dtype=tl.float32)
+    dK_1  = tl.zeros([BLOCK_N, D], dtype=tl.float32)
+    dK_2  = tl.zeros([BLOCK_N, D], dtype=tl.float32)
+    dK_3  = tl.zeros([BLOCK_N, D], dtype=tl.float32)
+    dV_0  = tl.zeros([BLOCK_N, D], dtype=tl.float32)
+    dV_1  = tl.zeros([BLOCK_N, D], dtype=tl.float32)
+    dV_2  = tl.zeros([BLOCK_N, D], dtype=tl.float32)
+    dV_3  = tl.zeros([BLOCK_N, D], dtype=tl.float32)
+    if J > 4:
+        dK_4  = tl.zeros([BLOCK_N, D], dtype=tl.float32)
+        dK_5  = tl.zeros([BLOCK_N, D], dtype=tl.float32)
+        dK_6  = tl.zeros([BLOCK_N, D], dtype=tl.float32)
+        dK_7  = tl.zeros([BLOCK_N, D], dtype=tl.float32)
+        dV_4  = tl.zeros([BLOCK_N, D], dtype=tl.float32)
+        dV_5  = tl.zeros([BLOCK_N, D], dtype=tl.float32)
+        dV_6  = tl.zeros([BLOCK_N, D], dtype=tl.float32)
+        dV_7  = tl.zeros([BLOCK_N, D], dtype=tl.float32)
+    if J > 8:
+        dK_8  = tl.zeros([BLOCK_N, D], dtype=tl.float32)
+        dK_9  = tl.zeros([BLOCK_N, D], dtype=tl.float32)
+        dK_10 = tl.zeros([BLOCK_N, D], dtype=tl.float32)
+        dK_11 = tl.zeros([BLOCK_N, D], dtype=tl.float32)
+        dV_8  = tl.zeros([BLOCK_N, D], dtype=tl.float32)
+        dV_9  = tl.zeros([BLOCK_N, D], dtype=tl.float32)
+        dV_10 = tl.zeros([BLOCK_N, D], dtype=tl.float32)
+        dV_11 = tl.zeros([BLOCK_N, D], dtype=tl.float32)
+    if J > 12:
+        dK_12 = tl.zeros([BLOCK_N, D], dtype=tl.float32)
+        dK_13 = tl.zeros([BLOCK_N, D], dtype=tl.float32)
+        dK_14 = tl.zeros([BLOCK_N, D], dtype=tl.float32)
+        dK_15 = tl.zeros([BLOCK_N, D], dtype=tl.float32)
+        dV_12 = tl.zeros([BLOCK_N, D], dtype=tl.float32)
+        dV_13 = tl.zeros([BLOCK_N, D], dtype=tl.float32)
+        dV_14 = tl.zeros([BLOCK_N, D], dtype=tl.float32)
+        dV_15 = tl.zeros([BLOCK_N, D], dtype=tl.float32)
 
     if CAUSAL:
         m_start = pid_n * BLOCK_N
@@ -675,6 +721,45 @@ def _bqa_dyn_attn_bwd_dkv_kernel(
             if j == 3:
                 dK_3 += dK_block
                 dV_3 += dV_eff_block
+            if J > 4:
+                if j == 4:
+                    dK_4 += dK_block
+                    dV_4 += dV_eff_block
+                if j == 5:
+                    dK_5 += dK_block
+                    dV_5 += dV_eff_block
+                if j == 6:
+                    dK_6 += dK_block
+                    dV_6 += dV_eff_block
+                if j == 7:
+                    dK_7 += dK_block
+                    dV_7 += dV_eff_block
+            if J > 8:
+                if j == 8:
+                    dK_8 += dK_block
+                    dV_8 += dV_eff_block
+                if j == 9:
+                    dK_9 += dK_block
+                    dV_9 += dV_eff_block
+                if j == 10:
+                    dK_10 += dK_block
+                    dV_10 += dV_eff_block
+                if j == 11:
+                    dK_11 += dK_block
+                    dV_11 += dV_eff_block
+            if J > 12:
+                if j == 12:
+                    dK_12 += dK_block
+                    dV_12 += dV_eff_block
+                if j == 13:
+                    dK_13 += dK_block
+                    dV_13 += dV_eff_block
+                if j == 14:
+                    dK_14 += dK_block
+                    dV_14 += dV_eff_block
+                if j == 15:
+                    dK_15 += dK_block
+                    dV_15 += dV_eff_block
 
     # Tail: store dK_per_h[b, h, n_block, j, :], dV_per_h, dVE_per_h, dgate.
     if HAS_VE:
@@ -692,6 +777,45 @@ def _bqa_dyn_attn_bwd_dkv_kernel(
         if j == 3:
             dK_j = dK_3
             dV_eff_j = dV_3
+        if J > 4:
+            if j == 4:
+                dK_j = dK_4
+                dV_eff_j = dV_4
+            if j == 5:
+                dK_j = dK_5
+                dV_eff_j = dV_5
+            if j == 6:
+                dK_j = dK_6
+                dV_eff_j = dV_6
+            if j == 7:
+                dK_j = dK_7
+                dV_eff_j = dV_7
+        if J > 8:
+            if j == 8:
+                dK_j = dK_8
+                dV_eff_j = dV_8
+            if j == 9:
+                dK_j = dK_9
+                dV_eff_j = dV_9
+            if j == 10:
+                dK_j = dK_10
+                dV_eff_j = dV_10
+            if j == 11:
+                dK_j = dK_11
+                dV_eff_j = dV_11
+        if J > 12:
+            if j == 12:
+                dK_j = dK_12
+                dV_eff_j = dV_12
+            if j == 13:
+                dK_j = dK_13
+                dV_eff_j = dV_13
+            if j == 14:
+                dK_j = dK_14
+                dV_eff_j = dV_14
+            if j == 15:
+                dK_j = dK_15
+                dV_eff_j = dV_15
 
         dK_ptrs = (
             DK_PH + b * sDKPb + h * sDKPh + j * sDKPj
@@ -753,10 +877,13 @@ def bqa_dyn_attn_triton_bwd(
     _, _, J, _ = k_basis.shape
     has_ve = ve is not None
 
-    # Backward kernels hardcode up to 4 J accumulators (separate Triton tile
-    # variables, since 3D acc tiles are 3-4× slower in practice). For larger J
-    # the kernel needs more slots — extend by adding `if j == k: ...` clauses.
-    assert J <= 4, f"backward kernels currently support J <= 4 (got J={J})"
+    # Backward dKV kernel hardcodes up to 16 J accumulators (separate Triton
+    # tile variables, since 3D acc tiles are 3-4× slower in practice). The dQ
+    # kernel no longer caches qk_j across phases (recomputes in Phase 4), so the
+    # only J ceiling is dKV's slot count. SMEM cost: each slot is BLOCK_N×D fp32;
+    # caller must pick BLOCK_N small enough to fit J slots × dK + J slots × dV
+    # plus auxiliary tiles inside the per-block SMEM budget (~228 KB on H100).
+    assert J <= 16, f"backward dKV kernel hardcodes 16 J slots (got J={J})"
 
     # Z[b, t, h] = <dy, y>_d  ("Δ" in FA backward).
     Z = (dy.float() * o.float()).sum(dim=-1)  # (B, T, H), fp32
@@ -816,16 +943,37 @@ def bqa_dyn_attn_triton_bwd(
 
     # Block defaults — small tiles keep shared mem headroom for the many in-flight
     # tiles backward needs (q, dy, score, p, dp, dscore, accumulators…).
+    # dKV kernel SMEM additionally scales with J because it holds J explicit
+    # dK_j / dV_j accumulators of shape (BLOCK_N, D) fp32 = BLOCK_N×512 bytes
+    # each. At J=14, BLOCK_N=32 would need 28 × 32 × 512 = 458 KB just for the
+    # dK/dV slots, busting H100. Shrink BLOCK_N as J grows.
     if dq_block_m is None:
-        dq_block_m = 32 if q.dtype == torch.float32 else 32
+        # At J ≥ 4 we use BLOCK_M=128 for better tensor-core utilization in the
+        # 128×D × D×16 reduction tile (paired with BLOCK_N=16 below). At J ≤ 3
+        # keep the small BLOCK_M default for SMEM headroom alongside num_stages=2.
+        if q.dtype == torch.float32:
+            dq_block_m = 32
+        elif J >= 4:
+            dq_block_m = 128
+        else:
+            dq_block_m = 32
     if dq_block_n is None:
-        dq_block_n = 16 if q.dtype == torch.float32 else 32
+        if q.dtype == torch.float32 or J >= 4:
+            dq_block_n = 16
+        else:
+            dq_block_n = 32
     if dkv_block_m is None:
         dkv_block_m = 32 if q.dtype == torch.float32 else 32
     if dkv_block_n is None:
-        dkv_block_n = 16 if q.dtype == torch.float32 else 32
+        if q.dtype == torch.float32 or J > 4:
+            # J>4: 16 dK + 16 dV slots × BLOCK_N × D × 4 bytes; BLOCK_N=16 caps
+            # the slots at 16 × 16 × 128 × 4 × 2 = 256 KB (borderline H100). The
+            # unused-slot tiles should be DCE'd by Triton when J<16.
+            dkv_block_n = 16
+        else:
+            dkv_block_n = 32
     if num_stages is None:
-        num_stages = 1 if q.dtype == torch.float32 else 2
+        num_stages = 1 if (q.dtype == torch.float32 or J > 4) else 2
     for blk in (dq_block_m, dq_block_n, dkv_block_m, dkv_block_n):
         assert (blk & (blk - 1)) == 0
 

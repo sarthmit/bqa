@@ -62,6 +62,12 @@ def _resolve_use_fa3():
 
 USE_FA3 = _resolve_use_fa3()
 
+# FA3 Hopper kernels reject head_dim > 256 (flash_api_stable.cpp:838). Some archs
+# (bqa_dyn) deliberately widen head_dim to J*D and rely on SDPA's mem_efficient
+# backend, which supports up to ~512 on Hopper. Route per-call by head_dim, not
+# just hardware. FA2 has the same 256 cap so it's not an option here.
+_FA3_MAX_HEAD_DIM = 256
+
 
 # =============================================================================
 # SDPA helpers
@@ -116,7 +122,7 @@ def flash_attn_func(q, k, v, causal=False, window_size=(-1, -1)):
     Returns:
         Output tensor of shape (B, T, H, D)
     """
-    if USE_FA3:
+    if USE_FA3 and q.size(-1) <= _FA3_MAX_HEAD_DIM:
         return _fa3.flash_attn_func(q, k, v, causal=causal, window_size=window_size)
 
     # SDPA fallback: transpose (B, T, H, D) -> (B, H, T, D)
@@ -146,7 +152,7 @@ def flash_attn_with_kvcache(q, k_cache, v_cache, k=None, v=None, cache_seqlens=N
     Returns:
         Output tensor of shape (B, T_new, H, D)
     """
-    if USE_FA3:
+    if USE_FA3 and q.size(-1) <= _FA3_MAX_HEAD_DIM:
         return _fa3.flash_attn_with_kvcache(
             q, k_cache, v_cache, k=k, v=v, cache_seqlens=cache_seqlens,
             causal=causal, window_size=window_size

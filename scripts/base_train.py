@@ -58,6 +58,7 @@ parser.add_argument("--bqa-init-mass-v", type=float, default=0.85, help="BQA / b
 parser.add_argument("--alpha-lr-mult", type=float, default=1.0, help="BQA: multiplier on the alpha_{k,v} (static) / b_alpha_{k,v} (bqa_dyn) AdamW LR, on top of the embedding_lr * dmodel scale. 1.0 is the existing baseline.")
 parser.add_argument("--alpha-beta1", type=float, default=0.9, help="BQA: AdamW beta1 for the alpha_{k,v} group. Default 0.9 matches the existing baseline; lower (e.g. 0.5) gives faster response on these tiny logit tensors.")
 parser.add_argument("--alpha-wd", type=float, default=0.0, help="BQA: AdamW weight_decay for the alpha_{k,v} group. Default 0.0 to avoid pulling the softmax toward uniform; small positive values may regularize.")
+parser.add_argument("--bqa-dyn-use-triton", action="store_true", help="bqa_dyn only: enable the fused Triton fwd+bwd kernel (nanochat/bqa_dyn_triton.py). Equivalence verified vs the default Q-fold + SDPA path; ~1.5-1.7x faster fwd, ~1.9-3.0x faster fwd+bwd on A100. Backward asserts J <= 4.")
 parser.add_argument("--seed", type=int, default=42, help="global torch seed for model init / dataloader shuffling. Same value used across all DDP ranks; non-determinism remains from cuDNN / flash-attn / fp8 kernels.")
 parser.add_argument("--max-seq-len", type=int, default=2048, help="max context length")
 parser.add_argument("--window-pattern", type=str, default="SSSL", help="sliding window pattern tiled across layers: L=full, S=half context (e.g. 'SSL')")
@@ -157,6 +158,7 @@ def build_model_meta(depth, n_kv_head_override=None, attn_kind_override=None):
         window_pattern=args.window_pattern, attn_kind=attn_kind,
         bqa_init_mass_k=args.bqa_init_mass_k,
         bqa_init_mass_v=args.bqa_init_mass_v,
+        bqa_dyn_use_triton=args.bqa_dyn_use_triton,
     )
     with torch.device("meta"):
         model_meta = GPT(config)
@@ -270,7 +272,12 @@ def disable_fp8(model):
 # Compile the model
 
 orig_model = model # original, uncompiled model, for saving raw model state_dict and for inference/evaluation (because the shapes may change shape)
-model = torch.compile(model, dynamic=False) # the inputs to model will never change shape so dynamic=False is safe
+model = torch.compile(model, dynamic=False) # the inputs to model will never change shape so dynamic=False is safe.
+# Note: when bqa_dyn_use_triton is set, DynamicBasisQueryAttention.forward is
+# decorated with @torch.compiler.disable so inductor graph-breaks around the
+# triton kernel. Disabling compile globally caused HBM OOM at d=16 full (compile
+# fuses activation memory); leaving compile on but breaking around attention
+# avoids the J≥8 inductor SMEM bust we hit before.
 
 # -----------------------------------------------------------------------------
 # Scaling laws and muP extrapolations to determine the optimal training horizon, batch size, learning rates, weight decay.
@@ -455,8 +462,8 @@ while True:
         model.eval()
         val_loader = build_val_loader()
         eval_steps = args.eval_tokens // (args.device_batch_size * args.max_seq_len * ddp_world_size)
-        with disable_fp8(model):
-            val_bpb = evaluate_bpb(model, val_loader, eval_steps, token_bytes)
+        with disable_fp8(orig_model):
+            val_bpb = evaluate_bpb(orig_model, val_loader, eval_steps, token_bytes)
         print0(f"Step {step:05d} | Validation bpb: {val_bpb:.6f}")
         if val_bpb < min_val_bpb:
             min_val_bpb = val_bpb
