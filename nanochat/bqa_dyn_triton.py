@@ -64,10 +64,11 @@ def _fwd_block_cfg(J, has_ve, dtype, save_l):
     """
     if dtype == torch.float32:
         return (32, 32, 4, 1)
-    if has_ve and J >= 14:
-        # At J ≥ 14 ve=on, even (32,16,4,2) busts SMEM (181 KB > 164 KB cap)
-        # with stages=2; drop to stages=1 (no pipelining) — small perf cost
-        # for OOM safety. J=12 ve=on still fits at stages=2.
+    if J >= 14:
+        # At J ≥ 14, the J >= 4 default (128, 16, 8, 2) busts SMEM on both A100
+        # (181 KB > 164 KB) and H100 (256 KB > 228 KB observed at d=28 J=14 fwd
+        # benchmark); drop to (32, 16, 4, 1) — works for has_ve and no-ve. Small
+        # perf cost vs the A100-tuned default but OOM-safe through J=16.
         return (32, 16, 4, 1)
     if has_ve and (save_l or J >= 10):
         # ve+save_l hits a Triton compiler regression at large BLOCK_M (40×
