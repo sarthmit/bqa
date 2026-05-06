@@ -1,7 +1,7 @@
 #!/bin/bash
 #SBATCH --account=rrg-bengioy-ad_gpu
 #SBATCH --job-name=bench_bqa_dyn_loop
-#SBATCH --time=00:25:00
+#SBATCH --time=00:15:00
 #SBATCH --nodes=1
 #SBATCH --gres=gpu:h100:1
 #SBATCH --cpus-per-task=8

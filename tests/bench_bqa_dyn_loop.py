@@ -86,19 +86,52 @@ def bench_one(label, J, H, T, has_ve):
 
     from nanochat.bqa_dyn_triton import bqa_dyn_attn
 
-    # --- correctness ---
+    # --- correctness (fwd + bwd) ---
+    # Forward
     with torch.no_grad():
-        y_ref = explicit_forward(q.detach(), k.detach(), v.detach(),
+        y_ref_nograd = explicit_forward(q.detach(), k.detach(), v.detach(),
                                   w_k.detach(), w_v.detach(),
                                   None, None, T, causal=True, window=-1)
-        y_tri = bqa_dyn_attn(
+        y_tri_nograd = bqa_dyn_attn(
             q.detach().contiguous(), k.detach().contiguous(), v.detach().contiguous(),
             w_k.detach().contiguous(), w_v.detach().contiguous(),
             ve=None, gate=None, causal=True, window_size=None,
         )
-    cos_fwd = F.cosine_similarity(y_tri.float().flatten(), y_ref.float().flatten(), dim=0).item()
-    abs_max = (y_tri.float() - y_ref.float()).abs().max().item()
+    cos_fwd = F.cosine_similarity(y_tri_nograd.float().flatten(), y_ref_nograd.float().flatten(), dim=0).item()
+    abs_max = (y_tri_nograd.float() - y_ref_nograd.float()).abs().max().item()
     fwd_ok = cos_fwd > 0.999
+
+    # Backward — compare gradients from triton vs gradients from explicit_forward.
+    # Use a fresh set of leaf tensors to avoid stale grads.
+    q_a = q.detach().clone().requires_grad_(True)
+    k_a = k.detach().clone().requires_grad_(True)
+    v_a = v.detach().clone().requires_grad_(True)
+    wk_a = w_k.detach().clone().requires_grad_(True)
+    wv_a = w_v.detach().clone().requires_grad_(True)
+    q_b = q.detach().clone().requires_grad_(True)
+    k_b = k.detach().clone().requires_grad_(True)
+    v_b = v.detach().clone().requires_grad_(True)
+    wk_b = w_k.detach().clone().requires_grad_(True)
+    wv_b = w_v.detach().clone().requires_grad_(True)
+    grad_o = torch.randn_like(q_a)
+
+    y_ref = explicit_forward(q_a, k_a, v_a, wk_a, wv_a, None, None, T, causal=True, window=-1)
+    y_ref.backward(grad_o)
+    y_tri_g = bqa_dyn_attn(q_b.contiguous(), k_b.contiguous(), v_b.contiguous(),
+                            wk_b.contiguous(), wv_b.contiguous(),
+                            ve=None, gate=None, causal=True, window_size=None)
+    y_tri_g.backward(grad_o)
+
+    def _cos(a, b):
+        return F.cosine_similarity(a.float().flatten(), b.float().flatten(), dim=0).item()
+    cos_dq = _cos(q_a.grad, q_b.grad)
+    cos_dk = _cos(k_a.grad, k_b.grad)
+    cos_dv = _cos(v_a.grad, v_b.grad)
+    cos_dwk = _cos(wk_a.grad, wk_b.grad)
+    cos_dwv = _cos(wv_a.grad, wv_b.grad)
+    bwd_min_cos = min(cos_dq, cos_dk, cos_dv, cos_dwk, cos_dwv)
+    bwd_ok = bwd_min_cos > 0.99
+    fwd_ok = fwd_ok and bwd_ok
 
     # --- forward perf ---
     torch.cuda.synchronize()
@@ -145,14 +178,20 @@ def bench_one(label, J, H, T, has_ve):
         "fwd_cos": cos_fwd,
         "fwd_abs_max": abs_max,
         "fwd_ok": fwd_ok,
+        "cos_dq": cos_dq,
+        "cos_dk": cos_dk,
+        "cos_dv": cos_dv,
+        "cos_dwk": cos_dwk,
+        "cos_dwv": cos_dwv,
+        "bwd_min_cos": bwd_min_cos,
     }
 
 
 def main():
     print(f"Device: {torch.cuda.get_device_name(0)}")
     print(f"B={B}, D={D}, dtype={DTYPE}\n")
-    print(f"{'config':<20} {'fwd ms':>10} {'fwd+bwd ms':>12} {'fwd cos':>10} {'fwd abs':>10} {'ok':>5}")
-    print("-" * 80)
+    print(f"{'config':<20} {'fwd ms':>10} {'fwd+bwd ms':>12} {'fwd cos':>10} {'bwd min cos':>12} {'ok':>5}")
+    print("-" * 90)
 
     results = []
     for cfg in CONFIGS:
@@ -160,7 +199,7 @@ def main():
             r = bench_one(*cfg)
             results.append(r)
             print(f"{r['label']:<20} {r['fwd_ms']:>10.3f} {r['fwd_bwd_ms']:>12.3f} "
-                  f"{r['fwd_cos']:>10.6f} {r['fwd_abs_max']:>10.3e} {str(r['fwd_ok']):>5}")
+                  f"{r['fwd_cos']:>10.6f} {r['bwd_min_cos']:>12.6f} {str(r['fwd_ok']):>5}")
         except Exception as e:
             err = str(e)[:200]
             print(f"{cfg[0]:<20} FAILED: {err}")
