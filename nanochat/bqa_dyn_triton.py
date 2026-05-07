@@ -67,9 +67,13 @@ def _fwd_block_cfg(J, has_ve, dtype, save_l):
     if J >= 14:
         # At J ≥ 14, the J >= 4 default (128, 16, 8, 2) busts SMEM on both A100
         # (181 KB > 164 KB) and H100 (256 KB > 228 KB observed at d=28 J=14 fwd
-        # benchmark); drop to (32, 16, 4, 1) — works for has_ve and no-ve. Small
-        # perf cost vs the A100-tuned default but OOM-safe through J=16.
-        return (32, 16, 4, 1)
+        # benchmark). H100's 228 KB cap can fit (64, 16, 8, 1): K+V tiles
+        # 14×16×128×2×2 = 112 KB, plus Q (16 KB) + acc (32 KB) + other ~10 KB
+        # ≈ 170 KB. Bigger BLOCK_M + more warps than the A100-safe (32, 16, 4, 1).
+        # ve case keeps the smaller config — extra ve tile per j busts at 64×16×8.
+        if has_ve:
+            return (32, 16, 4, 1)
+        return (64, 16, 8, 1)
     if has_ve and (save_l or J >= 10):
         # ve+save_l hits a Triton compiler regression at large BLOCK_M (40×
         # slowdown empirically). ve+J≥10 separately busts SMEM at (128,16,8,2)
@@ -1516,34 +1520,134 @@ def bqa_dyn_attn_triton_bwd(
 # =====================================================================
 
 
-class _BqaDynAttnFn(torch.autograd.Function):
-    @staticmethod
-    def forward(ctx, q, k_basis, v_basis, w_k, w_v, ve, gate, causal, window_size):
-        out, L = bqa_dyn_attn_triton_fwd(
-            q, k_basis, v_basis, w_k, w_v,
-            ve=ve, gate=gate,
-            causal=causal, window_size=window_size,
-            return_L=True,
-        )
-        ctx.save_for_backward(q, k_basis, v_basis, w_k, w_v, ve, gate, out, L)
-        ctx.causal = causal
-        ctx.window_size = window_size
-        ctx.has_ve = ve is not None
-        return out
+# Registered as a torch.library.custom_op so torch.compile's inductor treats it
+# as an opaque operator and keeps its FX graph contiguous around the call. With
+# the older torch.autograd.Function path, we needed to graph-break around the
+# attention forward to prevent inductor from fusing surrounding ops into a
+# triton kernel that busted H100 SMEM at J ≥ 8 — but the graph break also lost
+# cross-layer compile coverage, dropping training MFU to 5-11% even when the
+# kernel itself was 3× faster. The custom_op pattern fixes both.
+#
+# Schema notes:
+# - window_size as Tuple[int, int] isn't directly supported in custom_op's
+#   schema; we pass window_left as int (-1 means no window).
+# - Forward returns (out, L); L is needed for backward but the user-facing
+#   wrapper unpacks and discards it. With save_for_backward, we don't have to
+#   recompute L in the bwd path.
+# - Tensor inputs `ve` / `gate` are Optional[Tensor]; setup_context passes
+#   them via save_for_backward and the bwd reads them as `ve_saved is not None`.
+@torch.library.custom_op("bqa::dyn_attn_fwd", mutates_args=())
+def _bqa_dyn_attn_fwd_op(
+    q: torch.Tensor,
+    k_basis: torch.Tensor,
+    v_basis: torch.Tensor,
+    w_k: torch.Tensor,
+    w_v: torch.Tensor,
+    ve: Optional[torch.Tensor],
+    gate: Optional[torch.Tensor],
+    causal: bool,
+    window_left: int,
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    window_size = (window_left, 0) if window_left >= 0 else None
+    return bqa_dyn_attn_triton_fwd(
+        q, k_basis, v_basis, w_k, w_v,
+        ve=ve, gate=gate,
+        causal=causal, window_size=window_size,
+        return_L=True,
+    )
 
-    @staticmethod
-    def backward(ctx, dy):
-        q, k_basis, v_basis, w_k, w_v, ve, gate, out, L = ctx.saved_tensors
-        # If ve is None it's stored as None; saved_tensors handles that.
-        dy = dy.contiguous()
-        dq, dk, dv, dwk, dwv, dve, dgate = bqa_dyn_attn_triton_bwd(
-            dy, q, k_basis, v_basis, w_k, w_v, out, L,
-            ve=ve if ctx.has_ve else None,
-            gate=gate if ctx.has_ve else None,
-            causal=ctx.causal,
-            window_size=ctx.window_size,
-        )
-        return dq, dk, dv, dwk, dwv, dve, dgate, None, None
+
+@_bqa_dyn_attn_fwd_op.register_fake
+def _bqa_dyn_attn_fwd_fake(q, k_basis, v_basis, w_k, w_v, ve, gate, causal, window_left):
+    B, T, H, D = q.shape
+    out = torch.empty_like(q)
+    L = torch.empty((B, T, H), device=q.device, dtype=torch.float32)
+    return out, L
+
+
+# Backward as a separate custom_op so AOT autograd treats it as opaque too —
+# the autograd callback below just dispatches to torch.ops.bqa.dyn_attn_bwd,
+# preventing inductor from tracing into the Triton kernel calls (which use
+# raw data_ptr() and break under FakeTensor).
+#
+# Returns 7 Tensors. When ve was None in fwd, dve/dgate come back as 1-element
+# zero placeholders that the autograd callback discards (the input ve/gate had
+# requires_grad=False so autograd doesn't use the grad anyway).
+@torch.library.custom_op("bqa::dyn_attn_bwd", mutates_args=())
+def _bqa_dyn_attn_bwd_op(
+    grad_out: torch.Tensor,
+    q: torch.Tensor,
+    k_basis: torch.Tensor,
+    v_basis: torch.Tensor,
+    w_k: torch.Tensor,
+    w_v: torch.Tensor,
+    out: torch.Tensor,
+    L: torch.Tensor,
+    ve: Optional[torch.Tensor],
+    gate: Optional[torch.Tensor],
+    causal: bool,
+    window_left: int,
+) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    window_size = (window_left, 0) if window_left >= 0 else None
+    dq, dk, dv, dwk, dwv, dve, dgate = bqa_dyn_attn_triton_bwd(
+        grad_out, q, k_basis, v_basis, w_k, w_v, out, L,
+        ve=ve, gate=gate,
+        causal=causal, window_size=window_size,
+    )
+    if dve is None:
+        # custom_op return must be concrete tensors; placeholder for has_ve=False.
+        dve = torch.zeros((1,), device=q.device, dtype=q.dtype)
+        dgate = torch.zeros((1,), device=q.device, dtype=q.dtype)
+    return dq, dk, dv, dwk, dwv, dve, dgate
+
+
+@_bqa_dyn_attn_bwd_op.register_fake
+def _bqa_dyn_attn_bwd_fake(grad_out, q, k_basis, v_basis, w_k, w_v, out, L, ve, gate, causal, window_left):
+    dq = torch.empty_like(q)
+    dk = torch.empty_like(k_basis)
+    dv = torch.empty_like(v_basis)
+    dwk = torch.empty_like(w_k)
+    dwv = torch.empty_like(w_v)
+    if ve is not None:
+        dve = torch.empty_like(ve)
+        dgate = torch.empty_like(gate) if gate is not None else torch.zeros((1,), device=q.device, dtype=q.dtype)
+    else:
+        dve = torch.zeros((1,), device=q.device, dtype=q.dtype)
+        dgate = torch.zeros((1,), device=q.device, dtype=q.dtype)
+    return dq, dk, dv, dwk, dwv, dve, dgate
+
+
+def _bqa_dyn_attn_setup_context(ctx, inputs, output):
+    q, k_basis, v_basis, w_k, w_v, ve, gate, causal, window_left = inputs
+    out, L = output
+    ctx.save_for_backward(q, k_basis, v_basis, w_k, w_v, ve, gate, out, L)
+    ctx.causal = causal
+    ctx.window_left = window_left
+
+
+def _bqa_dyn_attn_op_backward(ctx, grad_out, grad_L):
+    # grad_L is the cotangent for the L return; we ignore it (L is bookkeeping
+    # for the kernel's online softmax, not user-facing).
+    q, k_basis, v_basis, w_k, w_v, ve, gate, out, L = ctx.saved_tensors
+    has_ve = ve is not None
+    dq, dk, dv, dwk, dwv, dve, dgate = torch.ops.bqa.dyn_attn_bwd(
+        grad_out.contiguous(),
+        q, k_basis, v_basis, w_k, w_v, out, L,
+        ve, gate, ctx.causal, ctx.window_left,
+    )
+    return (
+        dq, dk, dv, dwk, dwv,
+        dve if has_ve else None,
+        dgate if has_ve else None,
+        None, None,
+    )
+
+
+torch.library.register_autograd(
+    "bqa::dyn_attn_fwd",
+    _bqa_dyn_attn_op_backward,
+    setup_context=_bqa_dyn_attn_setup_context,
+)
 
 
 def bqa_dyn_attn(
@@ -1557,9 +1661,19 @@ def bqa_dyn_attn(
     causal: bool = True,
     window_size: Optional[Tuple[int, int]] = None,
 ) -> torch.Tensor:
-    """Autograd-wrapped bqa_dyn attention. Backward via Triton kernel.
+    """Autograd-wrapped bqa_dyn attention via torch.library.custom_op.
 
-    See `bqa_dyn_attn_triton_fwd` for argument semantics. Only the kwargs above
-    are supported (block sizes/staging are auto-picked).
+    Inductor sees this as an opaque op and can compile cleanly around it, so
+    no graph-break is needed in the calling module. See `bqa_dyn_attn_triton_fwd`
+    for argument semantics.
     """
-    return _BqaDynAttnFn.apply(q, k_basis, v_basis, w_k, w_v, ve, gate, causal, window_size)
+    if window_size is not None and window_size[0] >= 0:
+        window_left = int(window_size[0])
+    else:
+        window_left = -1
+    out, _L = torch.ops.bqa.dyn_attn_fwd(
+        q.contiguous(), k_basis.contiguous(), v_basis.contiguous(),
+        w_k.contiguous(), w_v.contiguous(),
+        ve, gate, causal, window_left,
+    )
+    return out
